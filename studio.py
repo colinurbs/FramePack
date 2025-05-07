@@ -291,7 +291,9 @@ def worker(
     job_stream=None,
     output_dir=None,
     metadata_dir=None,
-    resolution=640  # Add resolution parameter with default value
+    resolutionW=640,  # Add resolution parameter with default value
+    resolutionH=640,
+    lora_loaded_names=[]
 ):
     global transformer_original, transformer_f1, current_transformer, high_vram
     
@@ -425,7 +427,7 @@ def worker(
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=resolution)
+        height, width = find_nearest_bucket(H, W, resolution=resolutionW)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         if save_metadata:
@@ -448,24 +450,36 @@ def worker(
                 "latent_window_size": latent_window_size,
                 "mp4_crf": mp4_crf,
                 "timestamp": time.time(),
-                "resolution": resolution,  # Add resolution to metadata
+                "resolutionW": resolutionW,  # Add resolution to metadata
+                "resolutionH": resolutionH,
                 "model_type": model_type  # Add model type to metadata
             }
-            # # Add LoRA information to metadata if LoRAs are used
-            # if selected_loras and len(selected_loras) > 0:
-            #     lora_data = {}
-            #     for i, lora_name in enumerate(selected_loras):
-            #         # Get the corresponding weight if available
-            #         weight = lora_values[i] if lora_values and i < len(lora_values) else 1.0
-            #         # Handle case where weight might be a list
-            #         if isinstance(weight, list):
-            #             # If it's a list, use the first element or default to 1.0
-            #             weight_value = weight[0] if weight and len(weight) > 0 else 1.0
-            #         else:
-            #             weight_value = weight
-            #         lora_data[lora_name] = float(weight_value)
-                
-            #     metadata_dict["loras"] = lora_data
+            # Add LoRA information to metadata if LoRAs are used
+            def ensure_list(x):
+                if isinstance(x, list):
+                    return x
+                elif x is None:
+                    return []
+                else:
+                    return [x]
+
+            selected_loras = ensure_list(selected_loras)
+            lora_values = ensure_list(lora_values)
+
+            if selected_loras and len(selected_loras) > 0:
+                lora_data = {}
+                for lora_name in selected_loras:
+                    try:
+                        idx = lora_loaded_names.index(lora_name)
+                        weight = lora_values[idx] if lora_values and idx < len(lora_values) else 1.0
+                        if isinstance(weight, list):
+                            weight_value = weight[0] if weight and len(weight) > 0 else 1.0
+                        else:
+                            weight_value = weight
+                        lora_data[lora_name] = float(weight_value)
+                    except ValueError:
+                        lora_data[lora_name] = 1.0
+                metadata_dict["loras"] = lora_data
 
             with open(os.path.join(metadata_dir, f'{job_id}.json'), 'w') as f:
                 json.dump(metadata_dict, f, indent=2)
@@ -539,7 +553,8 @@ def worker(
 
         # --- LoRA loading and scaling ---
         if selected_loras:
-            for idx, lora_name in enumerate(selected_loras):
+            for lora_name in selected_loras:
+                idx = lora_loaded_names.index(lora_name)
                 lora_file = None
                 for ext in [".safetensors", ".pt"]:
                     # Find any file that starts with the lora_name and ends with the extension
@@ -910,14 +925,16 @@ def process(
         latent_type,
         clean_up_videos,
         selected_loras,
-        resolution,
-        *lora_values   
+        resolutionW,
+        resolutionH,
+        lora_loaded_names,
+        *lora_values
     ):
     
     # Create a blank black image if no 
     # Create a default image based on the selected latent_type
     if input_image is None:
-        default_height, default_width = 640, 640
+        default_height, default_width = resolutionH, resolutionW
         if latent_type == "White":
             # Create a white image
             input_image = np.ones((default_height, default_width, 3), dtype=np.uint8) * 255
@@ -965,7 +982,9 @@ def process(
         'clean_up_videos': clean_up_videos,
         'output_dir': settings.get("output_dir"),
         'metadata_dir': settings.get("metadata_dir"),
-        'resolution': resolution  # Add resolution parameter
+        'resolutionW': resolutionW, # Add resolution parameter
+        'resolutionH': resolutionH,
+        'lora_loaded_names': lora_loaded_names
     }
     
     # Add LoRA values if provided - extract them from the tuple
