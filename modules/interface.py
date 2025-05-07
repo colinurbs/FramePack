@@ -12,39 +12,8 @@ import io
 import json
 
 from modules.video_queue import JobStatus, Job
-from modules.prompt_handler import get_section_boundaries, get_quick_prompts, parse_timestamped_prompt
+from modules.prompt_handler import get_section_boundaries, get_quick_prompts, parse_timestamped_prompt, format_prompt_segments, parse_prompt_segments
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
-
-
-def format_prompt_segments(segments):
-    """Convert prompt segments to the format expected by the backend"""
-    formatted_parts = []
-    for segment in segments:
-        start_time = segment.get('start_time', 0)
-        prompt = segment.get('prompt', '')
-        if prompt:
-            formatted_parts.append(f"[{start_time}s: {prompt}]")
-    return " ".join(formatted_parts)
-
-
-def parse_prompt_segments(prompt_text):
-    """Parse existing prompt text to segments for editing"""
-    if not prompt_text or "[" not in prompt_text:
-        return [{"start_time": 0, "prompt": prompt_text}]
-    
-    segments = []
-    import re
-    pattern = r'\[(\d+(?:\.\d+)?s)(?:-(\d+(?:\.\d+)?s))?\s*:\s*(.*?)\]'
-    
-    for match in re.finditer(pattern, prompt_text):
-        start_time_str = match.group(1)
-        section_text = match.group(3).strip()
-        start_time = float(start_time_str.rstrip('s'))
-        segments.append({"start_time": start_time, "prompt": section_text})
-    
-    # Sort by start time
-    segments.sort(key=lambda x: x['start_time'])
-    return segments if segments else [{"start_time": 0, "prompt": ""}]
 
 
 def create_prompt_interface(default_prompt="[1s: The person waves hello] [3s: The person jumps up and down] [5s: The person does a dance]", max_segments=10):
