@@ -29,6 +29,8 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 from diffusers_helper import lora_utils
 from diffusers_helper.lora_utils import load_lora, unload_all_loras
 
+# Global cache for prompt embeddings
+prompt_embedding_cache = {}
 # Import from modules
 from modules.video_queue import VideoJobQueue, JobStatus
 from modules.prompt_handler import parse_timestamped_prompt
@@ -265,6 +267,32 @@ def load_lora_file(lora_file):
     except Exception as e:
         print(f"Error loading LoRA: {e}")
         return None, f"Error loading LoRA: {e}"
+
+@torch.no_grad()
+def get_cached_or_encode_prompt(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, target_device):
+    """
+    Retrieves prompt embeddings from cache or encodes them if not found.
+    Stores encoded embeddings (on CPU) in the cache.
+    Returns embeddings moved to the target_device.
+    """
+    if prompt in prompt_embedding_cache:
+        print(f"Cache hit for prompt: {prompt[:60]}...")
+        llama_vec_cpu, llama_mask_cpu, clip_l_pooler_cpu = prompt_embedding_cache[prompt]
+        # Move cached embeddings (from CPU) to the target device
+        llama_vec = llama_vec_cpu.to(target_device)
+        llama_attention_mask = llama_mask_cpu.to(target_device) if llama_mask_cpu is not None else None
+        clip_l_pooler = clip_l_pooler_cpu.to(target_device)
+        return llama_vec, llama_attention_mask, clip_l_pooler
+    else:
+        print(f"Cache miss for prompt: {prompt[:60]}...")
+        llama_vec, clip_l_pooler = encode_prompt_conds(
+            prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+        )
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        # Store CPU copies in cache
+        prompt_embedding_cache[prompt] = (llama_vec.cpu(), llama_attention_mask.cpu() if llama_attention_mask is not None else None, clip_l_pooler.cpu())
+        # Return embeddings already on the target device (as encode_prompt_conds uses the model's device)
+        return llama_vec, llama_attention_mask, clip_l_pooler
         
 @torch.no_grad()
 def worker(
@@ -396,10 +424,10 @@ def worker(
 
         encoded_prompts = {}
         for prompt in unique_prompts:
-            llama_vec, clip_l_pooler = encode_prompt_conds(
-                prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+            # Use the helper function for caching and encoding
+            llama_vec, llama_attention_mask, clip_l_pooler = get_cached_or_encode_prompt(
+                prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, gpu
             )
-            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
             encoded_prompts[prompt] = (llama_vec, llama_attention_mask, clip_l_pooler)
 
         # PROMPT BLENDING: Build a list of (start_section_idx, prompt) for each prompt
@@ -418,10 +446,10 @@ def worker(
                 torch.zeros_like(encoded_prompts[prompt_sections[0].prompt][2])
             )
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
-                n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+             # Use the helper function for caching and encoding negative prompt
+            llama_vec_n, llama_attention_mask_n, clip_l_pooler_n = get_cached_or_encode_prompt(
+                n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, gpu
             )
-            llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # Processing input image
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
