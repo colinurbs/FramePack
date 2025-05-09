@@ -9,11 +9,191 @@ from PIL import Image
 import numpy as np
 import base64
 import io
+import json
 
 from modules.video_queue import JobStatus, Job
-from modules.prompt_handler import get_section_boundaries, get_quick_prompts, parse_timestamped_prompt
+from modules.prompt_handler import get_section_boundaries, get_quick_prompts, parse_timestamped_prompt, format_prompt_segments, parse_prompt_segments
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from diffusers_helper.bucket_tools import find_nearest_bucket
+
+def create_prompt_interface(default_prompt="[1s: The person waves hello] [3s: The person jumps up and down] [5s: The person does a dance]", max_segments=10):
+    """Create a reusable prompt interface component"""
+    
+    # Container for the interface
+    interface = {}
+    
+    # Parse initial prompt
+    initial_segments = parse_prompt_segments(default_prompt)
+    
+    # Hidden state to store segments
+    interface['prompt_segments_state'] = gr.State(initial_segments)
+    
+    # Main UI container
+    with gr.Column():
+        gr.Markdown("### Prompt Timeline")
+        
+        # Create rows for each segment
+        interface['segment_rows'] = []
+        interface['segment_visibility'] = []
+        interface['segment_time_inputs'] = []
+        interface['segment_prompt_inputs'] = []
+        interface['segment_delete_buttons'] = []
+        
+        for i in range(max_segments):
+            visible = (i < len(initial_segments))
+            
+            with gr.Row(visible=visible) as row:
+                with gr.Column(scale=10):
+                    with gr.Row():
+                        time_input = gr.Number(
+                            label=f"Segment {i + 1} - Start Time (seconds)",
+                            value=initial_segments[i].get('start_time', 0) if i < len(initial_segments) else 0,
+                            minimum=0,
+                            maximum=120,
+                            step=0.1
+                        )
+                        prompt_input = gr.Textbox(
+                            label="Prompt",
+                            value=initial_segments[i].get('prompt', '') if i < len(initial_segments) else '',
+                            placeholder="Enter your prompt for this segment"
+                        )
+                with gr.Column(scale=1):
+                    delete_btn = gr.Button("❌", variant="stop", size="sm")
+            
+            interface['segment_rows'].append(row)
+            interface['segment_time_inputs'].append(time_input)
+            interface['segment_prompt_inputs'].append(prompt_input)
+            interface['segment_delete_buttons'].append(delete_btn)
+        
+        # Hidden components for state management
+        interface['hidden_prompt'] = gr.Textbox(value=default_prompt, visible=False)
+        interface['segment_count'] = gr.Number(value=len(initial_segments), visible=False)
+        
+        # Add segment button
+        with gr.Row():
+            interface['add_segment_button'] = gr.Button("+ Add Prompt Segment", variant="primary")
+    
+    return interface
+
+
+def connect_prompt_interface_events(interface, max_segments=10):
+    """Connect event handlers for the prompt interface"""
+    
+    # Helper functions for event handling
+    def update_segments(segment_count, *inputs):
+        """Update segments when time or prompt changes"""
+        segments = []
+        
+        for i in range(0, len(inputs), 2):
+            if i < segment_count * 2:
+                time_val = inputs[i]
+                prompt_val = inputs[i + 1]
+                if prompt_val:  # Only include segments with content
+                    segments.append({"start_time": time_val, "prompt": prompt_val})
+        
+        segments.sort(key=lambda x: x['start_time'])
+        formatted_prompt = format_prompt_segments(segments)
+        
+        return segments, formatted_prompt
+    
+    def add_segment(segment_count):
+        """Add a new segment"""
+        new_count = min(segment_count + 1, max_segments)
+        updates = []
+        
+        # Update visibility of rows
+        for i in range(max_segments):
+            updates.append(gr.update(visible=(i < new_count)))
+        
+        return [new_count] + updates
+    
+    def delete_segment(segment_index, segment_count, *inputs):
+        """Delete a segment"""
+        if segment_count <= 1:  # Keep at least one segment
+            return [gr.update()] * (max_segments * 3 + 1)
+        
+        segments = []
+        
+        # Collect all segments except the deleted one
+        for i in range(0, len(inputs), 2):
+            if i < segment_count * 2 and i // 2 != segment_index:
+                time_val = inputs[i]
+                prompt_val = inputs[i + 1]
+                if prompt_val:
+                    segments.append({"start_time": time_val, "prompt": prompt_val})
+        
+        segments.sort(key=lambda x: x['start_time'])
+        new_count = len(segments)
+        
+        # Prepare updates for all components
+        updates = []
+        
+        # Update segment count
+        updates.append(new_count)
+        
+        # Update row visibility
+        for i in range(max_segments):
+            updates.append(gr.update(visible=(i < new_count)))
+        
+        # Update time inputs
+        for i in range(max_segments):
+            if i < new_count:
+                updates.append(gr.update(value=segments[i]['start_time']))
+            else:
+                updates.append(gr.update(value=0))
+        
+        # Update prompt inputs
+        for i in range(max_segments):
+            if i < new_count:
+                updates.append(gr.update(value=segments[i]['prompt']))
+            else:
+                updates.append(gr.update(value=''))
+        
+        return updates
+    
+    # Get all inputs for the update function
+    all_inputs = []
+    for i in range(max_segments):
+        all_inputs.extend([
+            interface['segment_time_inputs'][i],
+            interface['segment_prompt_inputs'][i]
+        ])
+    
+    # Connect change handlers for all time and prompt inputs
+    for i in range(max_segments):
+        # Time input changes
+        interface['segment_time_inputs'][i].change(
+            fn=update_segments,
+            inputs=[interface['segment_count']] + all_inputs,
+            outputs=[interface['prompt_segments_state'], interface['hidden_prompt']]
+        )
+        
+        # Prompt input changes
+        interface['segment_prompt_inputs'][i].change(
+            fn=update_segments,
+            inputs=[interface['segment_count']] + all_inputs,
+            outputs=[interface['prompt_segments_state'], interface['hidden_prompt']]
+        )
+        
+        # Delete button clicks
+        interface['segment_delete_buttons'][i].click(
+            fn=delete_segment,
+            inputs=[gr.Number(i, visible=False), interface['segment_count']] + all_inputs,
+            outputs=[interface['segment_count']] + 
+                    interface['segment_rows'] + 
+                    interface['segment_time_inputs'] + 
+                    interface['segment_prompt_inputs']
+        )
+    
+    # Add segment button click
+    interface['add_segment_button'].click(
+        fn=add_segment,
+        inputs=[interface['segment_count']],
+        outputs=[interface['segment_count']] + interface['segment_rows']
+    )
+    
+    return interface
+
 
 def create_interface(
     process_fn,
@@ -54,9 +234,26 @@ def create_interface(
         height: 100% !important;
         background: #222;
     }
-    """
-
-    css += """
+    
+    .prompt-segment {
+        border: 1px solid #444;
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
+        background: #1a1a1a;
+    }
+    
+    .segment-controls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-top: 10px;
+    }
+    
+    .time-input {
+        width: 100px !important;
+    }
+    
     #fixed-toolbar {
         position: fixed;
         top: 0;
@@ -79,22 +276,43 @@ def create_interface(
         min-width: 80px !important;
     }
 
-
-
     .gr-button-primary{
         color:white;
     }
     body, .gradio-container {
         padding-top: 40px !important;
     }
-    """
-
-    css += """
     .narrow-button {
         min-width: 40px !important;
         width: 40px !important;
         padding: 0 !important;
         margin: 0 !important;
+    }
+    .thumbnail-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        padding: 10px;
+    }
+    .thumbnail-item {
+        width: 100px;
+        height: 100px;
+        border: 1px solid #444;
+        border-radius: 4px;
+        overflow: hidden;
+    }
+    .thumbnail-item img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+    #footer {
+        margin-top: 20px;
+        padding: 20px;
+        border-top: 1px solid #eee;
+    }
+    #footer a:hover {
+        color: #4f46e5 !important;
     }
     """
 
@@ -138,8 +356,15 @@ def create_interface(
                                 ["Black", "White", "Noise", "Green Screen"], label="Latent Image", value="Black", info="Used as a starting point if no image is provided"
                             )
 
-                        prompt = gr.Textbox(label="Prompt", value=default_prompt)
-
+                        # Create prompt interface for Original model
+                        prompt_interface = create_prompt_interface(default_prompt)
+                        prompt_segments_state = prompt_interface['prompt_segments_state']
+                        hidden_prompt = prompt_interface['hidden_prompt']
+                        segment_count = prompt_interface['segment_count']
+                        
+                        # Connect events
+                        connect_prompt_interface_events(prompt_interface)
+                        
                         with gr.Accordion("Prompt Parameters", open=False):
                             blend_sections = gr.Slider(
                                 minimum=0, maximum=10, value=4, step=1,
@@ -256,27 +481,6 @@ def create_interface(
                             thumbnail_container = gr.Column()
                             thumbnail_container.elem_classes = ["thumbnail-container"]
 
-                        # Add CSS for thumbnails
-                        css += """
-                        .thumbnail-container {
-                            display: flex;
-                            flex-wrap: wrap;
-                            gap: 10px;
-                            padding: 10px;
-                        }
-                        .thumbnail-item {
-                            width: 100px;
-                            height: 100px;
-                            border: 1px solid #444;
-                            border-radius: 4px;
-                            overflow: hidden;
-                        }
-                        .thumbnail-item img {
-                            width: 100%;
-                            height: 100%;
-                            object-fit: cover;
-                        }
-                        """
             with gr.TabItem("Outputs"):
                 outputDirectory_video = settings.get("output_dir", settings.default_settings['output_dir'])
                 outputDirectory_metadata = settings.get("metadata_dir", settings.default_settings['metadata_dir'])
@@ -428,14 +632,13 @@ def create_interface(
         # Connect the main process function (wrapper for adding to queue)
         def process_with_queue_update(model_type, *args):
             # Extract all arguments (ensure order matches inputs lists)
-            input_image, prompt_text, n_prompt, seed_value, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, randomize_seed_checked, save_metadata_checked, blend_sections, latent_type, clean_up_videos, selected_loras, resolutionW, resolutionH, *lora_args = args
+            input_image, prompt_segments, hidden_prompt_text, n_prompt, seed_value, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, randomize_seed_checked, save_metadata_checked, blend_sections, latent_type, clean_up_videos, selected_loras, resolutionW, resolutionH, *lora_args = args
 
-            # DO NOT parse the prompt here. Parsing happens once in the worker.
+            # Use the formatted prompt text
+            prompt_text = hidden_prompt_text
 
-            # Use the current seed value as is for this job
             # Call the process function with all arguments
-            # Pass the model_type and the ORIGINAL prompt_text string to the backend process function
-            result = process_fn(model_type, input_image, prompt_text, n_prompt, seed_value, total_second_length, # Pass original prompt_text string
+            result = process_fn(model_type, input_image, prompt_text, n_prompt, seed_value, total_second_length,
                             latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                             use_teacache, mp4_crf, save_metadata_checked, blend_sections, latent_type, clean_up_videos, selected_loras, resolutionW, resolutionH, *lora_args)
 
@@ -472,7 +675,8 @@ def create_interface(
         # --- Inputs for Original Model ---
         ips = [
             input_image,
-            prompt,
+            prompt_segments_state,
+            hidden_prompt,
             n_prompt,
             seed,
             total_second_length,
@@ -561,12 +765,9 @@ def create_interface(
 
 
         # --- Connect Metadata Loading ---
-        # Function to load metadata from JSON file
-        def load_metadata_from_json(json_path):
+        def load_metadata_from_json(json_path, max_segments=10):
             if not json_path:
-                # Return updates for all potentially affected components
-                num_orig_sliders = len(lora_sliders)
-                return [gr.update()] * (2 + num_orig_sliders)
+                return [gr.update()] * (3 + len(lora_names) + max_segments * 3 + 1)
 
             try:
                 with open(json_path, 'r') as f:
@@ -575,42 +776,73 @@ def create_interface(
                 prompt_val = metadata.get('prompt')
                 seed_val = metadata.get('seed')
 
+                # Parse the prompt into segments
+                segments = parse_prompt_segments(prompt_val) if prompt_val else [{"start_time": 0, "prompt": ""}]
+                segment_count = len(segments)
+
                 # Check for LoRA values in metadata
-                lora_weights = metadata.get('loras', {}) # Changed key to 'loras' based on studio.py worker
+                lora_weights = metadata.get('loras', {})
 
                 print(f"Loaded metadata from JSON: {json_path}")
                 print(f"Prompt: {prompt_val}, Seed: {seed_val}")
 
                 # Update the UI components
-                updates = [
-                    gr.update(value=prompt_val) if prompt_val else gr.update(),
-                    gr.update(value=seed_val) if seed_val is not None else gr.update()
-                ]
-
-                # Update LoRA sliders if they exist in metadata
+                updates = []
+                
+                # prompt_segments_state
+                updates.append(segments)
+                
+                # hidden_prompt
+                updates.append(gr.update(value=prompt_val) if prompt_val else gr.update())
+                
+                # seed
+                updates.append(gr.update(value=seed_val) if seed_val is not None else gr.update())
+                
+                # LoRA sliders
                 for lora in lora_names:
                     if lora in lora_weights:
                         updates.append(gr.update(value=lora_weights[lora]))
                     else:
-                        updates.append(gr.update()) # No change if LoRA not in metadata
+                        updates.append(gr.update())
 
-                # Ensure the number of updates matches the number of outputs
-                num_orig_sliders = len(lora_sliders)
-                return updates[:2 + num_orig_sliders] # Return updates for prompt, seed, and sliders
+                # segment_count
+                updates.append(segment_count)
+
+                # Update visibility of rows
+                for i in range(max_segments):
+                    updates.append(gr.update(visible=(i < segment_count)))
+
+                # Update time inputs
+                for i in range(max_segments):
+                    if i < segment_count:
+                        updates.append(gr.update(value=segments[i]['start_time']))
+                    else:
+                        updates.append(gr.update(value=0))
+
+                # Update prompt inputs  
+                for i in range(max_segments):
+                    if i < segment_count:
+                        updates.append(gr.update(value=segments[i]['prompt']))
+                    else:
+                        updates.append(gr.update(value=''))
+
+                return updates
 
             except Exception as e:
                 print(f"Error loading metadata: {e}")
-                num_orig_sliders = len(lora_sliders)
-                return [gr.update()] * (2 + num_orig_sliders)
-
+                return [gr.update()] * (3 + len(lora_names) + max_segments * 3 + 1)
 
         # Connect JSON metadata loader for Original tab
         json_upload.change(
             fn=load_metadata_from_json,
             inputs=[json_upload],
-            outputs=[prompt, seed] + [lora_sliders[lora] for lora in lora_names]
+            outputs=[prompt_segments_state, hidden_prompt, seed] + 
+                    [lora_sliders[lora] for lora in lora_names] + 
+                    [segment_count] + 
+                    prompt_interface['segment_rows'] + 
+                    prompt_interface['segment_time_inputs'] + 
+                    prompt_interface['segment_prompt_inputs']
         )
-
 
         # --- Helper Functions (defined within create_interface scope if needed by handlers) ---
         # Function to get queue statistics
@@ -662,18 +894,6 @@ def create_interface(
                 </div>
                 """)
 
-        # Add CSS for footer
-        css += """
-        #footer {
-            margin-top: 20px;
-            padding: 20px;
-            border-top: 1px solid #eee;
-        }
-        #footer a:hover {
-            color: #4f46e5 !important;
-        }
-        """
-
     return block
 
 
@@ -718,32 +938,3 @@ def format_queue_status(jobs):
             # Removed thumbnail from row data
         ])
     return rows
-
-# Create the queue status update function (wrapper around format_queue_status)
-def update_queue_status_with_thumbnails(): # Function name is now slightly misleading, but keep for now to avoid breaking clicks
-    # This function is likely called by the refresh button and potentially the timer
-    # It needs access to the job_queue object
-    # Assuming job_queue is accessible globally or passed appropriately
-    # For now, let's assume it's globally accessible as defined in studio.py
-    # If not, this needs adjustment based on how job_queue is managed.
-    try:
-        # Need access to the global job_queue instance from studio.py
-        # This might require restructuring or passing job_queue differently.
-        # For now, assuming it's accessible (this might fail if run standalone)
-        from __main__ import job_queue # Attempt to import from main script scope
-
-        jobs = job_queue.get_all_jobs()
-        for job in jobs:
-            if job.status == JobStatus.PENDING:
-                job.queue_position = job_queue.get_queue_position(job.id)
-
-        if job_queue.current_job:
-            job_queue.current_job.status = JobStatus.RUNNING
-
-        return format_queue_status(jobs)
-    except ImportError:
-        print("Error: Could not import job_queue. Queue status update might fail.")
-        return [] # Return empty list on error
-    except Exception as e:
-        print(f"Error updating queue status: {e}")
-        return []

@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 @dataclass
@@ -162,3 +162,90 @@ def get_quick_prompts() -> List[List[str]]:
         '[0s: Person looks surprised] [1.1s: Person raises arms above head] [2.2s-3.3s: Person puts hands on hips]'
     ]
     return [[x] for x in prompts]
+
+
+def parse_prompt_segments(prompt_text: str) -> List[Dict[str, float | str]]:
+    """
+    Parse existing prompt text to segments for editing in the UI
+    
+    Args:
+        prompt_text: The formatted prompt text with timestamps
+    
+    Returns:
+        List of dictionaries containing start_time and prompt for each segment
+    """
+    if not prompt_text or "[" not in prompt_text:
+        return [{"start_time": 0, "prompt": prompt_text}]
+    
+    segments = []
+    pattern = r'\[(\d+(?:\.\d+)?s)(?:-(\d+(?:\.\d+)?s))?\s*:\s*(.*?)\]'
+    
+    for match in re.finditer(pattern, prompt_text):
+        start_time_str = match.group(1)
+        section_text = match.group(3).strip()
+        start_time = float(start_time_str.rstrip('s'))
+        segments.append({"start_time": start_time, "prompt": section_text})
+    
+    # Sort by start time
+    segments.sort(key=lambda x: x['start_time'])
+    return segments if segments else [{"start_time": 0, "prompt": ""}]
+
+
+def format_prompt_segments(segments: List[Dict[str, float | str]]) -> str:
+    """
+    Convert prompt segments from UI format to the format expected by the backend
+    
+    Args:
+        segments: List of segment dictionaries with start_time and prompt
+    
+    Returns:
+        Formatted prompt string with timestamp notation
+    """
+    formatted_parts = []
+    for segment in segments:
+        start_time = segment.get('start_time', 0)
+        prompt = segment.get('prompt', '')
+        if prompt:
+            formatted_parts.append(f"[{start_time}s: {prompt}]")
+    return " ".join(formatted_parts)
+
+
+def validate_segments(segments: List[Dict[str, float | str]], total_duration: float) -> List[str]:
+    """
+    Validate prompt segments for potential issues
+    
+    Args:
+        segments: List of segment dictionaries
+        total_duration: Total video duration in seconds
+    
+    Returns:
+        List of validation error messages (empty if valid)
+    """
+    errors = []
+    
+    if not segments:
+        errors.append("At least one prompt segment is required")
+        return errors
+    
+    # Check for empty prompts
+    for i, segment in enumerate(segments):
+        if not segment.get('prompt', '').strip():
+            errors.append(f"Segment {i + 1} has an empty prompt")
+    
+    # Check for out-of-range times
+    for i, segment in enumerate(segments):
+        start_time = segment.get('start_time', 0)
+        if start_time < 0:
+            errors.append(f"Segment {i + 1} has negative start time")
+        elif start_time > total_duration:
+            errors.append(f"Segment {i + 1} starts after video ends")
+    
+    # Check for overlapping segments (optional - could be intentional for blending)
+    sorted_segments = sorted(segments, key=lambda x: x.get('start_time', 0))
+    for i in range(len(sorted_segments) - 1):
+        current_end = sorted_segments[i].get('start_time', 0) + 0.1  # Minimal duration
+        next_start = sorted_segments[i + 1].get('start_time', 0)
+        if current_end > next_start:
+            errors.append(f"Segments {i + 1} and {i + 2} have overlapping times")
+    
+    return errors
