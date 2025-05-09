@@ -48,44 +48,97 @@ def create_interface(
     # Create the interface
     css = make_progress_bar_css()
     css += """
+    /* Styles for the main fixed toolbar */
     .contain-image img {
         object-fit: contain !important;
         width: 100% !important;
         height: 100% !important;
         background: #222;
     }
-    """
-
-    css += """
     #fixed-toolbar {
         position: fixed;
         top: 0;
         left: 0;
         width: 100vw;
-        z-index: 1000;
-        background: rgb(11, 15, 25);
-        color: #fff;
-        padding: 10px 20px;
-        display: flex;
-        align-items: center;
-        gap: 16px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        border-bottom: 1px solid #4f46e5;
-    }
-    #toolbar-add-to-queue-btn button {
-        font-size: 14px !important;
-        padding: 4px 16px !important;
-        height: 32px !important;
-        min-width: 80px !important;
+        z-index: 1000 !important; /* Ensure it's on top */
+        background: var(--neutral-950, rgb(11, 15, 25)); /* Theme-aware background */
+        color: var(--body-text-color-dark, #fff); /* Theme-aware text color */
+        padding: 6px 20px 1px 20px; /* 1px bottom padding to sit just above the border line */
+        box-shadow: 0 1px 4px rgba(0,0,0,0.1); /* Slightly reduced shadow */
+        border-bottom: 1px solid var(--primary-500, #4f46e5); /* Theme-aware border */
+        box-sizing: border-box; /* Ensure padding is included in width/height */
     }
 
+    /* Wrapper for all content within the toolbar */
+    #toolbar-content-wrapper {
+        display: flex !important;
+        justify-content: space-between !important;
+        align-items: center !important;
+        width: 100% !important;
+        gap: 15px; /* Add some gap between left stack and refresh button */
+    }
 
+    /* Container for the stacked title and links on the left */
+    /* This is a gr.Column, so it stacks children by default */
+    #toolbar-left-stack {
+        gap: 0px !important; /* Remove gap between title and links within this column */
+        /* min-width is set in Python component for gr.Column */
+    }
 
+    /* Ensure the markdown component for the title doesn't show scrollbars */
+    #toolbar_title_markdown {
+        overflow: hidden !important;
+    }
+
+    /* Styling for the main title text */
+    #toolbar-title-text {
+        margin: 0 !important; /* No margin around the h1 itself */
+        font-size: 1.8em !important; /* Increased font size, closer to h1 */
+        line-height: 1.0 !important; /* Reduced line-height to bring links closer */
+        color: var(--body-text-color-dark, white) !important;
+        font-weight: bold;
+    }
+
+    /* Div grouping the links below the title */
+    #toolbar-links-group {
+        display: flex !important;
+        align-items: center !important;
+        margin-bottom: 0px !important; /* Links sit at the bottom of the toolbar's content area */
+        gap: 12px; /* Space between individual links */
+    }
+
+    .toolbar-link {
+        color: var(--button-secondary-background-fill, var(--button-background-fill, var(--neutral-400, grey))) !important; /* Match grey button background */
+        text-decoration: none !important; /* Remove underline */
+        font-size: 0.8em !important; /* Slightly larger link font */
+        line-height: 1 !important;
+    }
+    .toolbar-link:hover {
+        color: var(--primary-400, #a78bfa) !important; /* Lighter primary color for hover, theme-aware */
+        text-decoration: none !important; /* Remove underline on hover */
+    }
+
+    /* Styling for the refresh button's container div */
+    #refresh-stats-btn {
+        flex-shrink: 0; /* Prevent button container from shrinking */
+    }
+    /* Styling for the actual refresh button */
+    #refresh-stats-btn button {
+        padding: 5px 10px !important; /* Compact padding */
+        min-width: auto !important;
+        height: auto !important;
+        font-size: 1.1em !important; /* Icon size */
+    }
     .gr-button-primary{
         color:white;
     }
     body, .gradio-container {
-        padding-top: 40px !important;
+        padding-top: 52px !important; /* Accommodate new fixed toolbar height */
+    }
+    /* Reduce top margin of the main Tabs component to bring it closer to the toolbar */
+    .tabs { /* Common Gradio class for the Tabs component wrapper */
+        margin-top: 0px !important; /* Start with 0px, can adjust to a small positive value if needed */
+        padding-top: 0px !important; /* Also ensure no top padding on the tabs component itself */
     }
     """
 
@@ -103,14 +156,24 @@ def create_interface(
     block = gr.Blocks(css=css, title="FramePack Studio", theme=current_theme).queue()
 
     with block:
-
+        # --- Modified Fixed Toolbar ---
         with gr.Row(elem_id="fixed-toolbar"):
-            gr.Markdown("<h1 style='margin:0;color:white;'>FramePack Studio</h1>")
-            # with gr.Column(scale=1):
-            #     queue_stats_display = gr.Markdown("<p style='margin:0;color:white;'>Queue: 0 | Completed: 0</p>")
-            with gr.Column(scale=0):
-                refresh_stats_btn = gr.Button("⟳", elem_id="refresh-stats-btn")
+            with gr.Row(elem_id="toolbar-content-wrapper"): 
+                # Left Column for Title and Links (stacked)
+                with gr.Column(elem_id="toolbar-left-stack", scale=9, min_width=350): # scale helps push refresh btn
+                    gr.Markdown("<h1 id='toolbar-title-text'>FramePack Studio</h1>", elem_id="toolbar_title_markdown")
+                    gr.HTML("""
+                        <div id="toolbar-links-group">
+                            <a href="https://github.com/colinurbs/FramePack-Studio" target="_blank" class="toolbar-link">GitHub</a>
+                            <a href="https://discord.gg/MtuM7gFJ3V" target="_blank" class="toolbar-link">Discord</a>
+                            <a href="https://patreon.com/Colinu" target="_blank" class="toolbar-link">Support on Patreon</a>
+                        </div>
+                    """)
+                # Right part: Refresh Button (direct child, will be pushed by space-between)
+                refresh_stats_btn = gr.Button("⟳", elem_id="refresh-stats-btn", scale=1)
 
+        # Original refresh_stats_btn definition was inside the old toolbar structure.
+        # It's now defined within the new structure above.
 
         
 
@@ -643,36 +706,8 @@ def create_interface(
                 print(f"Error getting queue stats: {e}")
                 return "<p style='margin:0;color:white;'>Error loading queue stats</p>"
 
-        # Add footer with social links
-        with gr.Row(elem_id="footer"):
-            with gr.Column(scale=1):
-                gr.HTML("""
-                <div style="text-align: center; padding: 20px; color: #666;">
-                    <div style="margin-top: 10px;">
-                        <a href="https://patreon.com/Colinu" target="_blank" style="margin: 0 10px; color: #666; text-decoration: none;">
-                            <i class="fab fa-patreon"></i>Support on Patreon
-                        </a>
-                        <a href="https://discord.gg/MtuM7gFJ3V" target="_blank" style="margin: 0 10px; color: #666; text-decoration: none;">
-                            <i class="fab fa-discord"></i> Discord
-                        </a>
-                        <a href="https://github.com/colinurbs/FramePack-Studio" target="_blank" style="margin: 0 10px; color: #666; text-decoration: none;">
-                            <i class="fab fa-github"></i> GitHub
-                        </a>
-                    </div>
-                </div>
-                """)
+        # --- Footer with social links has been removed and integrated into the top toolbar ---
 
-        # Add CSS for footer
-        css += """
-        #footer {
-            margin-top: 20px;
-            padding: 20px;
-            border-top: 1px solid #eee;
-        }
-        #footer a:hover {
-            color: #4f46e5 !important;
-        }
-        """
 
     return block
 
