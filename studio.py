@@ -8,6 +8,7 @@ import traceback
 import einops
 import numpy as np
 import torch
+import datetime
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -314,6 +315,11 @@ def worker(
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
+    # --- Total progress tracking ---
+    total_steps = total_latent_sections * steps  # Total diffusion steps over all segments
+    step_durations = []  # Rolling history of recent step durations for ETA
+    last_step_time = time.time()
+
     # Parse the timestamped prompt with boundary snapping and reversing
     # prompt_text should now be the original string from the job queue
     prompt_sections = parse_timestamped_prompt(prompt_text, total_second_length, latent_window_size, model_type)
@@ -598,23 +604,51 @@ def worker(
 
         # --- Callback for progress ---
         def callback(d):
+            nonlocal last_step_time, step_durations
+            now_time = time.time()
+            # Record duration between diffusion steps (skip first where duration may include setup)
+            if last_step_time is not None:
+                step_delta = now_time - last_step_time
+                if step_delta > 0:
+                    step_durations.append(step_delta)
+                    if len(step_durations) > 30:  # Keep only recent 30 steps
+                        step_durations.pop(0)
+            last_step_time = now_time
+            avg_step = sum(step_durations) / len(step_durations) if step_durations else 0.0
+
             preview = d['denoised']
             preview = vae_decode_fake(preview)
             preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
             preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
-            if stream_to_use.input_queue.top() == 'end':
-                stream_to_use.output_queue.push(('end', None))
-                raise KeyboardInterrupt('User ends the task.')
-
+            # --- Progress & ETA logic ---
+            # Current segment progress
             current_step = d['i'] + 1
             percentage = int(100.0 * current_step / steps)
+
+            # Total progress
+            total_steps_done = section_idx * steps + current_step
+            total_percentage = int(100.0 * total_steps_done / total_steps)
+
+            # ETA calculations
+            def fmt_eta(sec):
+                try:
+                    return str(datetime.timedelta(seconds=int(sec)))
+                except Exception:
+                    return "--:--"
+
+            segment_eta = (steps - current_step) * avg_step if avg_step else 0
+            total_eta = (total_steps - total_steps_done) * avg_step if avg_step else 0
+
+            segment_hint = f'Sampling {current_step}/{steps}  ETA {fmt_eta(segment_eta)}'
+            total_hint = f'Total {total_steps_done}/{total_steps}  ETA {fmt_eta(total_eta)}'
+
             current_pos = (total_generated_latent_frames * 4 - 3) / 30
             original_pos = total_second_length - current_pos
             if current_pos < 0: current_pos = 0
             if original_pos < 0: original_pos = 0
 
-            hint = f'Sampling {current_step}/{steps}'
+            hint = segment_hint  # deprecated variable kept to minimise other code changes
             if model_type == "Original":
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, ' \
                        f'Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30):.2f} seconds (FPS-30). ' \
@@ -629,14 +663,14 @@ def worker(
             progress_data = {
                 'preview': preview,
                 'desc': desc,
-                'html': make_progress_bar_html(percentage, hint)
+                'html': make_progress_bar_html(percentage, segment_hint) + make_progress_bar_html(total_percentage, total_hint)
             }
             if job_stream is not None:
                 job = job_queue.get_job(job_id)
                 if job:
                     job.progress_data = progress_data
 
-            stream_to_use.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+            stream_to_use.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, segment_hint) + make_progress_bar_html(total_percentage, total_hint))))
 
         # --- Main generation loop ---
         for latent_padding in latent_paddings:
