@@ -287,6 +287,7 @@ def worker(
     latent_type,
     selected_loras,
     clean_up_videos, 
+    has_input_image,
     lora_values=None, 
     job_stream=None,
     output_dir=None,
@@ -426,8 +427,8 @@ def worker(
         # Processing input image
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
-        H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=resolutionW)
+        H, W, _ = input_image.shape
+        height, width = find_nearest_bucket(H, W, resolution=resolutionW if has_input_image else (resolutionH+resolutionW)/2)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         if save_metadata:
@@ -934,7 +935,9 @@ def process(
     
     # Create a blank black image if no 
     # Create a default image based on the selected latent_type
+    has_input_image = True
     if input_image is None:
+        has_input_image = False
         default_height, default_width = resolutionH, resolutionW
         if latent_type == "White":
             # Create a white image
@@ -981,6 +984,7 @@ def process(
         'save_metadata': save_metadata,
         'selected_loras': selected_loras,
         'clean_up_videos': clean_up_videos,
+        'has_input_image': has_input_image,
         'output_dir': settings.get("output_dir"),
         'metadata_dir': settings.get("metadata_dir"),
         'resolutionW': resolutionW, # Add resolution parameter
