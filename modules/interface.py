@@ -14,7 +14,7 @@ import json
 from modules.video_queue import JobStatus, Job
 from modules.prompt_handler import get_section_boundaries, get_quick_prompts, parse_timestamped_prompt, format_prompt_segments, parse_prompt_segments
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
-
+from diffusers_helper.bucket_tools import find_nearest_bucket
 
 def create_prompt_interface(default_prompt="[1s: The person waves hello] [3s: The person jumps up and down] [5s: The person does a dance]", max_segments=10):
     """Create a reusable prompt interface component"""
@@ -330,13 +330,18 @@ def create_interface(
                 refresh_stats_btn = gr.Button("⟳", elem_id="refresh-stats-btn")
 
 
-        # Hidden state to track the selected model type
-        selected_model_type = gr.State("Original")
+        
 
         with gr.Tabs():
-            with gr.Tab("Generate (Original)", id="original_tab"):
+            with gr.Tab("Generate", id="generate_tab"):
                 with gr.Row():
                     with gr.Column(scale=2):
+                        model_type = gr.Radio(
+                            choices=["Original", "F1"],
+                            value="Original",
+                            label="Model Type",
+                            info="Select which model to use for generation"
+                        )
                         input_image = gr.Image(
                             sources='upload',
                             type="numpy",
@@ -369,21 +374,33 @@ def create_interface(
                             with gr.Row():
                                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1)
                                 total_second_length = gr.Slider(label="Video Length (Seconds)", minimum=1, maximum=120, value=6, step=0.1)
-                            with gr.Row("Resolution"):
-                                resolutionW = gr.Slider(
-                                    label="Width", minimum=128, maximum=768, value=640, step=32, 
-                                    info="Nearest valid width will be used."
-                                )
-                                resolutionH = gr.Slider(
-                                    label="Height", minimum=128, maximum=768, value=640, step=32, 
-                                    info="Nearest valid height will be used."
-                                )
-                                def on_input_image_change(img):
-                                    if img is not None:
-                                        return gr.update(info="Nearest valid bucket size will be used. Height will be adjusted automatically."), gr.update(visible=False)
-                                    else:
-                                        return gr.update(info="Nearest valid width will be used."), gr.update(visible=True)
-                                input_image.change(fn=on_input_image_change, inputs=[input_image], outputs=[resolutionW, resolutionH])
+                            with gr.Group():
+                                with gr.Row("Resolution"):
+                                    resolutionW = gr.Slider(
+                                        label="Width", minimum=128, maximum=768, value=640, step=32, 
+                                        info="Nearest valid width will be used."
+                                    )
+                                    resolutionH = gr.Slider(
+                                        label="Height", minimum=128, maximum=768, value=640, step=32, 
+                                        info="Nearest valid height will be used."
+                                    )
+                                resolution_text = gr.Markdown(value="<div style='text-align:right; padding:5px 15px 5px 5px;'>Selected bucket for resolution: 640 x 640</div>", label="", show_label=False)
+                            def on_input_image_change(img):
+                                if img is not None:
+                                    return gr.update(info="Nearest valid bucket size will be used. Height will be adjusted automatically."), gr.update(visible=False)
+                                else:
+                                    return gr.update(info="Nearest valid width will be used."), gr.update(visible=True)
+                            input_image.change(fn=on_input_image_change, inputs=[input_image], outputs=[resolutionW, resolutionH])
+                            def on_resolution_change(img, resolutionW, resolutionH):
+                                out_bucket_resH, out_bucket_resW = [640, 640]
+                                if img is not None:
+                                    H, W, _ = img.shape
+                                    out_bucket_resH, out_bucket_resW = find_nearest_bucket(H, W, resolution=resolutionW)
+                                else:
+                                    out_bucket_resH, out_bucket_resW = find_nearest_bucket(resolutionH, resolutionW, (resolutionW+resolutionH)/2) # if resolutionW > resolutionH else resolutionH
+                                return gr.update(value=f"<div style='text-align:right; padding:5px 15px 5px 5px;'>Selected bucket for resolution: {out_bucket_resW} x {out_bucket_resH}</div>")
+                            resolutionW.change(fn=on_resolution_change, inputs=[input_image, resolutionW, resolutionH], outputs=[resolution_text], show_progress="hidden")
+                            resolutionH.change(fn=on_resolution_change, inputs=[input_image, resolutionW, resolutionH], outputs=[resolution_text], show_progress="hidden")
                             with gr.Row("LoRAs"):
                                 lora_selector = gr.Dropdown(
                                     choices=lora_names,
@@ -410,7 +427,7 @@ def create_interface(
                                 save_metadata = gr.Checkbox(label="Save Metadata", value=True, info="Save to JSON file")
                             with gr.Row("TeaCache"):
                                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-                                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
+                                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True)  # Make visible for both models
 
                             with gr.Row():
                                 seed = gr.Number(label="Seed", value=31337, precision=0)
@@ -441,113 +458,6 @@ def create_interface(
                             end_button = gr.Button(value="Cancel Current Job", interactive=True)
                             start_button = gr.Button(value="Add to Queue", elem_id="toolbar-add-to-queue-btn")
 
-            with gr.Tab("Generate (F1)", id="f1_tab"):
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        f1_input_image = gr.Image(
-                            sources='upload',
-                            type="numpy",
-                            label="Image (optional)",
-                            height=420,
-                            elem_classes="contain-image"
-                        )
-
-
-                        with gr.Accordion("Latent Image Options", open=False):
-                            f1_latent_type = gr.Dropdown(
-                                ["Black", "White", "Noise", "Green Screen"], label="Latent Image", value="Black", info="Used as a starting point if no image is provided"
-                            )
-
-                        # Create prompt interface for F1 model
-                        f1_prompt_interface = create_prompt_interface(default_prompt)
-                        f1_prompt_segments_state = f1_prompt_interface['prompt_segments_state']
-                        f1_hidden_prompt = f1_prompt_interface['hidden_prompt']
-                        f1_segment_count = f1_prompt_interface['segment_count']
-                        
-                        # Connect events for F1
-                        connect_prompt_interface_events(f1_prompt_interface)
-
-                        with gr.Accordion("Prompt Parameters", open=False):
-                            f1_blend_sections = gr.Slider(
-                                minimum=0, maximum=10, value=4, step=1,
-                                label="Number of sections to blend between prompts"
-                            )
-                        with gr.Accordion("Generation Parameters", open=True):
-                            with gr.Row():
-                                f1_steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1)
-                                f1_total_second_length = gr.Slider(label="Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
-                            with gr.Row("Resolution"):
-                                f1_resolutionW = gr.Slider(
-                                    label="Width", minimum=128, maximum=768, value=640, step=32, 
-                                    info="Nearest valid width will be used."
-                                )
-                                f1_resolutionH = gr.Slider(
-                                    label="Height", minimum=128, maximum=768, value=640, step=32,
-                                    info="Nearest valid height will be used."
-                                )
-                                def f1_on_input_image_change(img):
-                                    if img is not None:
-                                        return gr.update(info="Nearest valid bucket size will be used. Height will be adjusted automatically."), gr.update(visible=False)
-                                    else:
-                                        return gr.update(info="Nearest valid width will be used."), gr.update(visible=True)
-                                f1_input_image.change(fn=f1_on_input_image_change, inputs=[f1_input_image], outputs=[f1_resolutionW, f1_resolutionH])
-                            with gr.Row("LoRAs"):
-                                f1_lora_selector = gr.Dropdown(
-                                    choices=lora_names,
-                                    label="Select LoRAs to Load",
-                                    multiselect=True,
-                                    value=[],
-                                    info="Select one or more LoRAs to use for this job"
-                                )
-                                f1_lora_names_states = gr.State(lora_names)
-                                f1_lora_sliders = {}
-                                for lora in lora_names:
-                                    f1_lora_sliders[lora] = gr.Slider(
-                                        minimum=0.0, maximum=2.0, value=1.0, step=0.01,
-                                        label=f"{lora} Weight", visible=False, interactive=True
-                                    )
-
-                            with gr.Row("Metadata"):
-                                f1_json_upload = gr.File(
-                                    label="Upload Metadata JSON (optional)",
-                                    file_types=[".json"],
-                                    type="filepath",
-                                    height=100,
-                                )
-                                f1_save_metadata = gr.Checkbox(label="Save Metadata", value=True, info="Save to JSON file")
-                            with gr.Row("TeaCache"):
-                                f1_use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-                                f1_n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True)
-
-                            with gr.Row():
-                                f1_seed = gr.Number(label="Seed", value=31337, precision=0)
-                                f1_randomize_seed = gr.Checkbox(label="Randomize", value=False, info="Generate a new random seed for each job")
-
-                        with gr.Accordion("Advanced Parameters", open=False):
-                            f1_latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info='Change at your own risk, very experimental')
-                            f1_cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)
-                            f1_gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01)
-                            f1_rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)
-                            f1_gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=1, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
-                        with gr.Accordion("Output Parameters", open=False):
-                            f1_mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
-                            f1_clean_up_videos = gr.Checkbox(
-                                label="Clean up video files",
-                                value=True,
-                                info="If checked, only the final video will be kept after generation."
-                            )
-
-                    with gr.Column():
-                        f1_preview_image = gr.Image(label="Next Latents", height=150, visible=True, type="numpy", interactive=False)
-                        f1_result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=256, loop=True)
-                        f1_progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
-                        f1_progress_bar = gr.HTML('', elem_classes='no-generating-animation')
-
-                        with gr.Row():
-                            f1_current_job_id = gr.Textbox(label="Current Job ID", visible=True, interactive=True)
-                            f1_end_button = gr.Button(value="Cancel Current Job", interactive=True)
-                            f1_start_button = gr.Button(value="Add to Queue", elem_id="toolbar-add-to-queue-btn")
-
             with gr.Tab("Queue"):
                 with gr.Row():
                     with gr.Column():
@@ -571,68 +481,67 @@ def create_interface(
                             thumbnail_container = gr.Column()
                             thumbnail_container.elem_classes = ["thumbnail-container"]
 
-            # with gr.TabItem("Outputs"):
-            #     outputDirectory = settings.get("output_dir", settings.default_settings['output_dir'])
-            #     def get_gallery_items():
-            #         items = []
-            #         for f in os.listdir(outputDirectory):
-            #             if f.endswith(".png"):
-            #                 prefix = os.path.splitext(f)[0]
-            #                 latest_video = get_latest_video_version(prefix)
-            #                 if latest_video:
-            #                     video_path = os.path.join(outputDirectory, latest_video)
-            #                     mtime = os.path.getmtime(video_path)
-            #                     preview_path = os.path.join(outputDirectory, f)
-            #                     items.append((preview_path, prefix, mtime))
-            #         items.sort(key=lambda x: x[2], reverse=True)
-            #         return [(i[0], i[1]) for i in items]
-            #     def get_latest_video_version(prefix):
-            #         max_number = -1
-            #         selected_file = None
-            #         for f in os.listdir(outputDirectory):
-            #             if f.startswith(prefix + "_") and f.endswith(".mp4"):
-            #                 num = int(f.replace(prefix + "_", '').replace(".mp4", ''))
-            #                 if num > max_number:
-            #                     max_number = num
-            #                     selected_file = f
-            #         return selected_file
-            #     def load_video_and_info_from_prefix(prefix):
-            #         video_file = get_latest_video_version(prefix)
-            #         if not video_file:
-            #             return None, "JSON not found."
-            #         video_path = os.path.join(outputDirectory, video_file)
-            #         json_path = os.path.join(outputDirectory, prefix) + ".json"
-            #         info = {"description": "no info"}
-            #         if os.path.exists(json_path):
-            #             with open(json_path, "r", encoding="utf-8") as f:
-            #                 info = json.load(f)
-            #         return video_path, json.dumps(info, indent=2, ensure_ascii=False)
-            #     gallery_items_state = gr.State(get_gallery_items())
-            #     with gr.Row():
-            #         with gr.Column(scale=2):
-            #             thumbs = gr.Gallery(
-            #                 # value=[i[0] for i in get_gallery_items()],
-            #                 columns=[4],
-            #                 allow_preview=False,
-            #                 object_fit="cover",
-            #                 height="auto"
-            #             )
-            #             refresh_button = gr.Button("Update")
-            #         with gr.Column(scale=5):
-            #             video_out = gr.Video(sources=[], autoplay=True, loop=True, visible=False)
-            #         with gr.Column(scale=1):
-            #             info_out = gr.Textbox(label="Generation info", visible=False)
-            #         def refresh_gallery():
-            #             new_items = get_gallery_items()
-            #             return gr.update(value=[i[0] for i in new_items]), new_items
-            #         refresh_button.click(fn=refresh_gallery, outputs=[thumbs, gallery_items_state])
-                    
-            #         def on_select(evt: gr.SelectData, gallery_items):
-            #             prefix = gallery_items[evt.index][1]
-            #             video, info = load_video_and_info_from_prefix(prefix)
-            #             return gr.update(value=video, visible=True), gr.update(value=info, visible=True)
-            #         thumbs.select(fn=on_select, inputs=[gallery_items_state], outputs=[video_out, info_out])
-
+            with gr.TabItem("Outputs"):
+                outputDirectory_video = settings.get("output_dir", settings.default_settings['output_dir'])
+                outputDirectory_metadata = settings.get("metadata_dir", settings.default_settings['metadata_dir'])
+                def get_gallery_items():
+                    items = []
+                    for f in os.listdir(outputDirectory_metadata):
+                        if f.endswith(".png"):
+                            prefix = os.path.splitext(f)[0]
+                            latest_video = get_latest_video_version(prefix)
+                            if latest_video:
+                                video_path = os.path.join(outputDirectory_video, latest_video)
+                                mtime = os.path.getmtime(video_path)
+                                preview_path = os.path.join(outputDirectory_metadata, f)
+                                items.append((preview_path, prefix, mtime))
+                    items.sort(key=lambda x: x[2], reverse=True)
+                    return [(i[0], i[1]) for i in items]
+                def get_latest_video_version(prefix):
+                    max_number = -1
+                    selected_file = None
+                    for f in os.listdir(outputDirectory_video):
+                        if f.startswith(prefix + "_") and f.endswith(".mp4"):
+                            num = int(f.replace(prefix + "_", '').replace(".mp4", ''))
+                            if num > max_number:
+                                max_number = num
+                                selected_file = f
+                    return selected_file
+                def load_video_and_info_from_prefix(prefix):
+                    video_file = get_latest_video_version(prefix)
+                    if not video_file:
+                        return None, "JSON not found."
+                    video_path = os.path.join(outputDirectory_video, video_file)
+                    json_path = os.path.join(outputDirectory_metadata, prefix) + ".json"
+                    info = {"description": "no info"}
+                    if os.path.exists(json_path):
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            info = json.load(f)
+                    return video_path, json.dumps(info, indent=2, ensure_ascii=False)
+                gallery_items_state = gr.State(get_gallery_items())
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        thumbs = gr.Gallery(
+                            # value=[i[0] for i in get_gallery_items()],
+                            columns=[4],
+                            allow_preview=False,
+                            object_fit="cover",
+                            height="auto"
+                        )
+                        refresh_button = gr.Button("Update")
+                    with gr.Column(scale=5):
+                        video_out = gr.Video(sources=[], autoplay=True, loop=True, visible=False)
+                    with gr.Column(scale=1):
+                        info_out = gr.Textbox(label="Generation info", visible=False)
+                    def refresh_gallery():
+                        new_items = get_gallery_items()
+                        return gr.update(value=[i[0] for i in new_items]), new_items
+                    refresh_button.click(fn=refresh_gallery, outputs=[thumbs, gallery_items_state])
+                    def on_select(evt: gr.SelectData, gallery_items):
+                        prefix = gallery_items[evt.index][1]
+                        video, info = load_video_and_info_from_prefix(prefix)
+                        return gr.update(value=video, visible=True), gr.update(value=info, visible=True)
+                    thumbs.select(fn=on_select, inputs=[gallery_items_state], outputs=[video_out, info_out])
             with gr.Tab("Settings"):
                 with gr.Row():
                     with gr.Column():
@@ -792,59 +701,19 @@ def create_interface(
         # Add LoRA sliders to the input list
         ips.extend([lora_sliders[lora] for lora in lora_names])
 
-        # --- Inputs for F1 Model ---
-        f1_ips = [
-            f1_input_image,
-            f1_prompt_segments_state,
-            f1_hidden_prompt,
-            f1_n_prompt,
-            f1_seed,
-            f1_total_second_length,
-            f1_latent_window_size,
-            f1_steps,
-            f1_cfg,
-            f1_gs,
-            f1_rs,
-            f1_gpu_memory_preservation,
-            f1_use_teacache,
-            f1_mp4_crf,
-            f1_randomize_seed,
-            f1_save_metadata,
-            f1_blend_sections,
-            f1_latent_type,
-            f1_clean_up_videos,
-            f1_lora_selector,
-            f1_resolutionW,
-            f1_resolutionH,
-            f1_lora_names_states
-        ]
-        # Add F1 LoRA sliders to the input list
-        f1_ips.extend([f1_lora_sliders[lora] for lora in lora_names])
 
         # --- Connect Buttons ---
         start_button.click(
-            # Pass "Original" model type
-            fn=lambda *args: process_with_queue_update("Original", *args),
-            inputs=ips,
+            # Pass the selected model type from the radio buttons
+            fn=lambda selected_model, *args: process_with_queue_update(selected_model, *args),
+            inputs=[model_type] + ips,
             outputs=[result_video, current_job_id, preview_image, progress_desc, progress_bar, start_button, end_button, queue_status, seed]
-        )
-
-        f1_start_button.click(
-            # Pass "F1" model type
-            fn=lambda *args: process_with_queue_update("F1", *args),
-            inputs=f1_ips,
-            # Update F1 outputs and shared queue/job ID
-            outputs=[f1_result_video, f1_current_job_id, f1_preview_image, f1_progress_desc, f1_progress_bar, f1_start_button, f1_end_button, queue_status, f1_seed]
         )
 
         # Connect the end button to cancel the current job and update the queue
         end_button.click(
             fn=end_process_with_update,
             outputs=[queue_status]
-        )
-        f1_end_button.click(
-            fn=end_process_with_update,
-            outputs=[queue_status] # Update shared queue status display
         )
 
         # --- Connect Monitoring ---
@@ -856,12 +725,6 @@ def create_interface(
             outputs=[result_video, current_job_id, preview_image, progress_desc, progress_bar, start_button, end_button]
         )
 
-        # Monitor F1 tab (using the same monitor function for now, assuming job IDs are unique)
-        f1_current_job_id.change(
-            fn=monitor_fn,
-            inputs=[f1_current_job_id],
-            outputs=[f1_result_video, f1_current_job_id, f1_preview_image, f1_progress_desc, f1_progress_bar, f1_start_button, f1_end_button]
-        )
 
         # --- Connect Queue Refresh ---
         refresh_stats_btn.click(
@@ -900,22 +763,8 @@ def create_interface(
             outputs=[lora_sliders[lora] for lora in lora_names] # Assumes lora_sliders keys match lora_names
         )
 
-        # Function to update F1 LoRA sliders
-        def update_f1_lora_sliders(selected_loras):
-            updates = []
-            for lora in lora_names:
-                 updates.append(gr.update(visible=(lora in selected_loras)))
-            num_sliders = len(f1_lora_sliders)
-            return updates[:num_sliders]
 
-        # Connect the F1 dropdown to the F1 sliders
-        f1_lora_selector.change(
-            fn=update_f1_lora_sliders,
-            inputs=[f1_lora_selector],
-            outputs=[f1_lora_sliders[lora] for lora in lora_names]
-        )
-
-        # --- Connect Metadata Loading for both models ---
+        # --- Connect Metadata Loading ---
         def load_metadata_from_json(json_path, max_segments=10):
             if not json_path:
                 return [gr.update()] * (3 + len(lora_names) + max_segments * 3 + 1)
@@ -995,17 +844,36 @@ def create_interface(
                     prompt_interface['segment_prompt_inputs']
         )
 
-        # Connect JSON metadata loader for F1 tab
-        f1_json_upload.change(
-            fn=load_metadata_from_json,
-            inputs=[f1_json_upload],
-            outputs=[f1_prompt_segments_state, f1_hidden_prompt, f1_seed] + 
-                    [f1_lora_sliders[lora] for lora in lora_names] + 
-                    [f1_segment_count] + 
-                    f1_prompt_interface['segment_rows'] + 
-                    f1_prompt_interface['segment_time_inputs'] + 
-                    f1_prompt_interface['segment_prompt_inputs']
-        )
+        # --- Helper Functions (defined within create_interface scope if needed by handlers) ---
+        # Function to get queue statistics
+        def get_queue_stats():
+            try:
+                # Get all jobs from the queue
+                jobs = job_queue.get_all_jobs()
+
+                # Count jobs by status
+                status_counts = {
+                    "QUEUED": 0,
+                    "RUNNING": 0,
+                    "COMPLETED": 0,
+                    "FAILED": 0,
+                    "CANCELLED": 0
+                }
+
+                for job in jobs:
+                    if hasattr(job, 'status'):
+                        status = str(job.status) # Use str() for safety
+                        if status in status_counts:
+                            status_counts[status] += 1
+
+                # Format the display text
+                stats_text = f"Queue: {status_counts['QUEUED']} | Running: {status_counts['RUNNING']} | Completed: {status_counts['COMPLETED']} | Failed: {status_counts['FAILED']} | Cancelled: {status_counts['CANCELLED']}"
+
+                return f"<p style='margin:0;color:white;'>{stats_text}</p>"
+
+            except Exception as e:
+                print(f"Error getting queue stats: {e}")
+                return "<p style='margin:0;color:white;'>Error loading queue stats</p>"
 
         # Add footer with social links
         with gr.Row(elem_id="footer"):

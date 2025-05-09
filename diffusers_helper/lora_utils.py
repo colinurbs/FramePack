@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Dict, List, Optional, Union
 from diffusers.loaders.lora_pipeline import _fetch_state_dict
 from diffusers.loaders.lora_conversion_utils import _convert_hunyuan_video_lora_to_diffusers
@@ -33,7 +33,17 @@ def load_lora(transformer, lora_path: Path, weight_name: Optional[str] = "pytorc
 
     state_dict = _convert_hunyuan_video_lora_to_diffusers(state_dict)
     
-    adapter_name = weight_name.split(".")[0]
+    # should weight_name even be Optional[str] or just str?
+    # For now, we assume it is never None
+    # The module name in the state_dict must not include a . in the name
+    # See https://github.com/pytorch/pytorch/pull/6639/files#diff-4be56271f7bfe650e3521c81fd363da58f109cd23ee80d243156d2d6ccda6263R133-R134
+    adapter_name = PurePath(str(weight_name).replace('_DOT_', '.')).stem.replace('.', '_DOT_')
+    if '_DOT_' in adapter_name:
+        print(
+            f"LoRA file '{weight_name}' contains a '.' in the name. " +
+            'This may cause issues. Consider renaming the file.' +
+            f" Using '{adapter_name}' as the adapter name to be safe."
+        )
     
     # Check if adapter already exists and delete it if it does
     if hasattr(transformer, 'peft_config') and adapter_name in transformer.peft_config:

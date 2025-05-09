@@ -2,12 +2,14 @@ from diffusers_helper.hf_login import login
 
 import json
 import os
+from pathlib import PurePath
 import time
 import argparse
 import traceback
 import einops
 import numpy as np
 import torch
+import datetime
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -29,6 +31,11 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 from diffusers_helper import lora_utils
 from diffusers_helper.lora_utils import load_lora, unload_all_loras
 
+# Import model generators
+from modules.generators import create_model_generator
+
+# Global cache for prompt embeddings
+prompt_embedding_cache = {}
 # Import from modules
 from modules.video_queue import VideoJobQueue, JobStatus
 from modules.prompt_handler import parse_timestamped_prompt
@@ -92,10 +99,8 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-# Initialize transformer placeholders
-transformer_original = None
-transformer_f1 = None
-current_transformer = None # Will hold the currently active model
+# Initialize model generator placeholder
+current_generator = None # Will hold the currently active model generator
 
 # Load models based on VRAM availability later
  
@@ -152,14 +157,15 @@ os.makedirs(outputs_folder, exist_ok=True)
 settings = Settings()
 
 # --- Populate LoRA names AFTER settings are loaded ---
-lora_folder_from_settings = settings.get("lora_dir", default_lora_folder) # Use setting, fallback to default
+lora_folder_from_settings: str = settings.get("lora_dir", default_lora_folder) # Use setting, fallback to default
 print(f"Scanning for LoRAs in: {lora_folder_from_settings}")
 if os.path.isdir(lora_folder_from_settings):
     try:
         lora_files = [f for f in os.listdir(lora_folder_from_settings)
                      if f.endswith('.safetensors') or f.endswith('.pt')]
         for lora_file in lora_files:
-            lora_names.append(lora_file.split('.')[0]) # Get name without extension
+            lora_name = PurePath(lora_file).stem
+            lora_names.append(lora_name) # Get name without extension
         print(f"Found LoRAs: {lora_names}")
     except Exception as e:
         print(f"Error scanning LoRA directory '{lora_folder_from_settings}': {e}")
@@ -172,99 +178,77 @@ else:
 job_queue = VideoJobQueue()
 
 
-def move_lora_adapters_to_device(model, target_device):
-    """
-    Move all LoRA adapters in a model to the specified device.
-    This handles the PEFT implementation of LoRA.
-    """
-    print(f"Moving all LoRA adapters to {target_device}")
-    
-    # First, find all modules with LoRA adapters
-    lora_modules = []
-    for name, module in model.named_modules():
-        if hasattr(module, 'active_adapter') and hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-            lora_modules.append((name, module))
-    
-    # Now move all LoRA components to the target device
-    for name, module in lora_modules:
-        # Get the active adapter name
-        active_adapter = module.active_adapter
-        
-        # Move the LoRA layers to the target device
-        if active_adapter is not None:
-            if isinstance(module.lora_A, torch.nn.ModuleDict):
-                # Handle ModuleDict case (PEFT implementation)
-                for adapter_name in list(module.lora_A.keys()):
-                    # Move lora_A
-                    if adapter_name in module.lora_A:
-                        module.lora_A[adapter_name] = module.lora_A[adapter_name].to(target_device)
-                    
-                    # Move lora_B
-                    if adapter_name in module.lora_B:
-                        module.lora_B[adapter_name] = module.lora_B[adapter_name].to(target_device)
-                    
-                    # Move scaling
-                    if hasattr(module, 'scaling') and isinstance(module.scaling, dict) and adapter_name in module.scaling:
-                        if isinstance(module.scaling[adapter_name], torch.Tensor):
-                            module.scaling[adapter_name] = module.scaling[adapter_name].to(target_device)
-            else:
-                # Handle direct attribute case
-                if hasattr(module, 'lora_A') and module.lora_A is not None:
-                    module.lora_A = module.lora_A.to(target_device)
-                if hasattr(module, 'lora_B') and module.lora_B is not None:
-                    module.lora_B = module.lora_B.to(target_device)
-                if hasattr(module, 'scaling') and module.scaling is not None:
-                    if isinstance(module.scaling, torch.Tensor):
-                        module.scaling = module.scaling.to(target_device)
-    
-    print(f"Moved all LoRA adapters to {target_device}")
-    return model
-
 
 # Function to load a LoRA file
-def load_lora_file(lora_file):
+def load_lora_file(lora_file: str | PurePath):
     if not lora_file:
         return None, "No file selected"
     
     try:
         # Get the filename from the path
-        _, lora_name = os.path.split(lora_file)
+        lora_path = PurePath(lora_file)
+        lora_name = lora_path.name
         
         # Copy the file to the lora directory
-        lora_dest = os.path.join(lora_dir, lora_name)
+        lora_dest = PurePath(lora_dir, lora_path)
         import shutil
         shutil.copy(lora_file, lora_dest)
         
-        # Load the LoRA - NOTE: This needs adjustment for multiple transformers
-        global current_transformer, lora_names
-        if current_transformer is None:
+        # Load the LoRA
+        global current_generator, lora_names
+        if current_generator is None:
             return None, "Error: No model loaded to apply LoRA to. Generate something first."
         
-        # ADDED: Unload any existing LoRAs first
-        current_transformer = lora_utils.unload_all_loras(current_transformer)
+        # Unload any existing LoRAs first
+        current_generator.unload_loras()
         
-        current_transformer = lora_utils.load_lora(current_transformer, lora_dir, lora_name)
+        # Load the single LoRA
+        selected_loras = [lora_path.stem]
+        current_generator.load_loras(selected_loras, lora_dir, selected_loras)
         
         # Add to lora_names if not already there
-        lora_base_name = lora_name.split('.')[0]
+        lora_base_name = lora_path.stem
         if lora_base_name not in lora_names:
             lora_names.append(lora_base_name)
         
         # Get the current device of the transformer
-        device = next(current_transformer.parameters()).device
+        device = next(current_generator.transformer.parameters()).device
         
         # Move all LoRA adapters to the same device as the base model
-        move_lora_adapters_to_device(current_transformer, device)
+        current_generator.move_lora_adapters_to_device(device)
         
-        print(f"Loaded LoRA: {lora_name} to {type(current_transformer).__name__}")
-        
-        # ADDED: Verify LoRA state after loading
-        verify_lora_state(current_transformer, "After loading LoRA file")
+        print(f"Loaded LoRA: {lora_name} to {current_generator.get_model_name()} model")
         
         return gr.update(choices=lora_names), f"Successfully loaded LoRA: {lora_name}"
     except Exception as e:
         print(f"Error loading LoRA: {e}")
         return None, f"Error loading LoRA: {e}"
+
+@torch.no_grad()
+def get_cached_or_encode_prompt(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, target_device):
+    """
+    Retrieves prompt embeddings from cache or encodes them if not found.
+    Stores encoded embeddings (on CPU) in the cache.
+    Returns embeddings moved to the target_device.
+    """
+    if prompt in prompt_embedding_cache:
+        print(f"Cache hit for prompt: {prompt[:60]}...")
+        llama_vec_cpu, llama_mask_cpu, clip_l_pooler_cpu = prompt_embedding_cache[prompt]
+        # Move cached embeddings (from CPU) to the target device
+        llama_vec = llama_vec_cpu.to(target_device)
+        llama_attention_mask = llama_mask_cpu.to(target_device) if llama_mask_cpu is not None else None
+        clip_l_pooler = clip_l_pooler_cpu.to(target_device)
+        return llama_vec, llama_attention_mask, clip_l_pooler
+    else:
+        print(f"Cache miss for prompt: {prompt[:60]}...")
+        llama_vec, clip_l_pooler = encode_prompt_conds(
+            prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+        )
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        # Store CPU copies in cache
+        prompt_embedding_cache[prompt] = (llama_vec.cpu(), llama_attention_mask.cpu() if llama_attention_mask is not None else None, clip_l_pooler.cpu())
+        # Return embeddings already on the target device (as encode_prompt_conds uses the model's device)
+        return llama_vec, llama_attention_mask, clip_l_pooler
         
 @torch.no_grad()
 def worker(
@@ -287,6 +271,7 @@ def worker(
     latent_type,
     selected_loras,
     clean_up_videos, 
+    has_input_image,
     lora_values=None, 
     job_stream=None,
     output_dir=None,
@@ -295,24 +280,26 @@ def worker(
     resolutionH=640,
     lora_loaded_names=[]
 ):
-    global transformer_original, transformer_f1, current_transformer, high_vram
+    global high_vram, current_generator
     
-    # ADDED: Ensure any existing LoRAs are unloaded from the current transformer
-    if current_transformer is not None:
+    # Ensure any existing LoRAs are unloaded from the current generator
+    if current_generator is not None:
         print("Unloading any existing LoRAs before starting new job")
-        current_transformer = lora_utils.unload_all_loras(current_transformer)
+        current_generator.unload_loras()
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-    # ADDED: Verify LoRA state at worker start
-    verify_lora_state(current_transformer, "Worker start")
-    
     stream_to_use = job_stream if job_stream is not None else stream
 
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
+
+    # --- Total progress tracking ---
+    total_steps = total_latent_sections * steps  # Total diffusion steps over all segments
+    step_durations = []  # Rolling history of recent step durations for ETA
+    last_step_time = time.time()
 
     # Parse the timestamped prompt with boundary snapping and reversing
     # prompt_text should now be the original string from the job queue
@@ -325,61 +312,36 @@ def worker(
         if not high_vram:
             # Unload everything *except* the potentially active transformer
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae)
-            if current_transformer is not None:
-                offload_model_from_device_for_memory_preservation(current_transformer, target_device=gpu, preserved_memory_gb=8)
+            if current_generator is not None and current_generator.transformer is not None:
+                offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
 
         # --- Model Loading / Switching ---
         print(f"Worker starting for model type: {model_type}")
-        target_transformer_model = None
-        other_transformer_model = None
-
-        if model_type == "Original":
-            if transformer_original is None:
-                print("Loading Original Transformer...")
-                transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
-                transformer_original.eval()
-                transformer_original.to(dtype=torch.bfloat16)
-                transformer_original.requires_grad_(False)
-                if not high_vram:
-                    DynamicSwapInstaller.install_model(transformer_original, device=gpu)
-                print("Original Transformer Loaded.")
-            target_transformer_model = transformer_original
-            other_transformer_model = transformer_f1
-        elif model_type == "F1":
-            if transformer_f1 is None:
-                print("Loading F1 Transformer...")
-                transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
-                transformer_f1.eval()
-                transformer_f1.to(dtype=torch.bfloat16)
-                transformer_f1.requires_grad_(False)
-                if not high_vram:
-                    DynamicSwapInstaller.install_model(transformer_f1, device=gpu)
-                print("F1 Transformer Loaded.")
-            target_transformer_model = transformer_f1
-            other_transformer_model = transformer_original
-        else:
-            raise ValueError(f"Unknown model_type: {model_type}")
-
-        # Unload the *other* model if it exists and we are in low VRAM mode
-        if not high_vram and other_transformer_model is not None:
-            print(f"Offloading inactive transformer: {type(other_transformer_model).__name__}")
-            offload_model_from_device_for_memory_preservation(other_transformer_model, target_device=gpu, preserved_memory_gb=8)
-            # Consider fully unloading if memory pressure is extreme:
-            # unload_complete_models(other_transformer_model)
-            # if model_type == "Original": transformer_f1 = None
-            # else: transformer_original = None
-
-        current_transformer = target_transformer_model # Set the globally accessible current model
-
-        # ADDED: Ensure the target model has no LoRAs loaded
-        print(f"Ensuring {model_type} transformer has no LoRAs loaded")
-        current_transformer = lora_utils.unload_all_loras(current_transformer)
-        verify_lora_state(current_transformer, "After model selection")
-
-        # Ensure the target model is on the correct device if in high VRAM mode
-        if high_vram and current_transformer.device != gpu:
-            print(f"Moving {model_type} transformer to GPU (High VRAM mode)...")
-            current_transformer.to(gpu)
+        
+        # Create the appropriate model generator
+        new_generator = create_model_generator(
+            model_type,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            image_encoder=image_encoder,
+            feature_extractor=feature_extractor,
+            high_vram=high_vram,
+            prompt_embedding_cache=prompt_embedding_cache,
+            settings=settings
+        )
+        
+        # Update the global generator
+        current_generator = new_generator
+        
+        # Load the transformer model
+        current_generator.load_model()
+        
+        # Ensure the model has no LoRAs loaded
+        print(f"Ensuring {model_type} model has no LoRAs loaded")
+        current_generator.unload_loras()
 
         # Pre-encode all prompts
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding all prompts...'))))
@@ -396,10 +358,10 @@ def worker(
 
         encoded_prompts = {}
         for prompt in unique_prompts:
-            llama_vec, clip_l_pooler = encode_prompt_conds(
-                prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+            # Use the helper function for caching and encoding
+            llama_vec, llama_attention_mask, clip_l_pooler = get_cached_or_encode_prompt(
+                prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, gpu
             )
-            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
             encoded_prompts[prompt] = (llama_vec, llama_attention_mask, clip_l_pooler)
 
         # PROMPT BLENDING: Build a list of (start_section_idx, prompt) for each prompt
@@ -418,16 +380,16 @@ def worker(
                 torch.zeros_like(encoded_prompts[prompt_sections[0].prompt][2])
             )
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
-                n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+             # Use the helper function for caching and encoding negative prompt
+            llama_vec_n, llama_attention_mask_n, clip_l_pooler_n = get_cached_or_encode_prompt(
+                n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, gpu
             )
-            llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # Processing input image
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
-        H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=resolutionW)
+        H, W, _ = input_image.shape
+        height, width = find_nearest_bucket(H, W, resolution=resolutionW if has_input_image else (resolutionH+resolutionW)/2)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         if save_metadata:
@@ -509,13 +471,13 @@ def worker(
         # Dtype
         for prompt_key in encoded_prompts:
             llama_vec, llama_attention_mask, clip_l_pooler = encoded_prompts[prompt_key]
-            llama_vec = llama_vec.to(current_transformer.dtype)
-            clip_l_pooler = clip_l_pooler.to(current_transformer.dtype)
+            llama_vec = llama_vec.to(current_generator.transformer.dtype)
+            clip_l_pooler = clip_l_pooler.to(current_generator.transformer.dtype)
             encoded_prompts[prompt_key] = (llama_vec, llama_attention_mask, clip_l_pooler)
 
-        llama_vec_n = llama_vec_n.to(current_transformer.dtype)
-        clip_l_pooler_n = clip_l_pooler_n.to(current_transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(current_transformer.dtype)
+        llama_vec_n = llama_vec_n.to(current_generator.transformer.dtype)
+        clip_l_pooler_n = clip_l_pooler_n.to(current_generator.transformer.dtype)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(current_generator.transformer.dtype)
 
         # Sampling
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
@@ -523,120 +485,93 @@ def worker(
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
-        if model_type == "Original":
-            history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
-        else:  # F1 model
-            # F1モードでは初期フレームを用意
-            history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, height // 8, width // 8), dtype=torch.float32).cpu()
-            # 開始フレームをhistory_latentsに追加
-            history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2)
-            total_generated_latent_frames = 1  # 最初のフレームを含むので1から開始
+        # Initialize history latents based on model type
+        history_latents = current_generator.prepare_history_latents(height, width)
+        
+        # For F1 model, initialize with start latent
+        if model_type == "F1":
+            history_latents = current_generator.initialize_with_start_latent(history_latents, start_latent)
+            total_generated_latent_frames = 1  # Start with 1 for F1 model since it includes the first frame
 
         history_pixels = None
         if model_type == "Original":
             total_generated_latent_frames = 0
-            # Original model uses reversed latent paddings
-            latent_paddings = reversed(range(total_latent_sections))
-            if total_latent_sections > 4:
-                latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
-        else:  # F1 model
-            # F1 model doesn't use latent paddings in the same way
-            # We'll use a fixed approach with just 0 for last section and 1 for others
-            latent_paddings = [1] * (total_latent_sections - 1) + [0]
+        
+        # Get latent paddings from the generator
+        latent_paddings = current_generator.get_latent_paddings(total_latent_sections)
 
         # PROMPT BLENDING: Track section index
         section_idx = 0
 
-        # ADDED: Completely unload all loras from the current transformer
-        current_transformer = lora_utils.unload_all_loras(current_transformer)
-        verify_lora_state(current_transformer, "Before loading LoRAs")
-
-        # --- LoRA loading and scaling ---
+        # Load LoRAs if selected
         if selected_loras:
-            for lora_name in selected_loras:
-                idx = lora_loaded_names.index(lora_name)
-                lora_file = None
-                for ext in [".safetensors", ".pt"]:
-                    # Find any file that starts with the lora_name and ends with the extension
-                    matching_files = [f for f in os.listdir(lora_folder_from_settings) 
-                                   if f.startswith(lora_name) and f.endswith(ext)]
-                    if matching_files:
-                        lora_file = matching_files[0]  # Use the first matching file
-                        break
-                if lora_file:
-                    print(f"Loading LoRA {lora_file} to {model_type} model")
-                    current_transformer = lora_utils.load_lora(current_transformer, lora_folder_from_settings, lora_file)
-                    # Set LoRA strength if provided
-                    if lora_values and idx < len(lora_values):
-                        lora_strength = float(lora_values[idx])
-                        print(f"Setting LoRA {lora_name} strength to {lora_strength}")
-                        # Set scaling for this LoRA by iterating through modules
-                        for name, module in current_transformer.named_modules():
-                            if hasattr(module, 'scaling'):
-                                if isinstance(module.scaling, dict):
-                                    # Handle ModuleDict case (PEFT implementation)
-                                    if lora_name in module.scaling:
-                                        if isinstance(module.scaling[lora_name], torch.Tensor):
-                                            module.scaling[lora_name] = torch.tensor(
-                                                lora_strength, device=module.scaling[lora_name].device
-                                            )
-                                        else:
-                                            module.scaling[lora_name] = lora_strength
-                                else:
-                                    # Handle direct attribute case for scaling if needed
-                                    if isinstance(module.scaling, torch.Tensor):
-                                        module.scaling = torch.tensor(
-                                            lora_strength, device=module.scaling.device
-                                        )
-                                    else:
-                                        module.scaling = lora_strength
-                else:
-                    print(f"LoRA file for {lora_name} not found!")
-            
-            # ADDED: Verify LoRA state after loading
-            verify_lora_state(current_transformer, "After loading LoRAs")
+            current_generator.load_loras(selected_loras, lora_folder_from_settings, lora_loaded_names, lora_values)
 
         # --- Callback for progress ---
         def callback(d):
+            nonlocal last_step_time, step_durations
+            now_time = time.time()
+            # Record duration between diffusion steps (skip first where duration may include setup)
+            if last_step_time is not None:
+                step_delta = now_time - last_step_time
+                if step_delta > 0:
+                    step_durations.append(step_delta)
+                    if len(step_durations) > 30:  # Keep only recent 30 steps
+                        step_durations.pop(0)
+            last_step_time = now_time
+            avg_step = sum(step_durations) / len(step_durations) if step_durations else 0.0
+
             preview = d['denoised']
             preview = vae_decode_fake(preview)
             preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
             preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
-            if stream_to_use.input_queue.top() == 'end':
-                stream_to_use.output_queue.push(('end', None))
-                raise KeyboardInterrupt('User ends the task.')
-
+            # --- Progress & ETA logic ---
+            # Current segment progress
             current_step = d['i'] + 1
             percentage = int(100.0 * current_step / steps)
+
+            # Total progress
+            total_steps_done = section_idx * steps + current_step
+            total_percentage = int(100.0 * total_steps_done / total_steps)
+
+            # ETA calculations
+            def fmt_eta(sec):
+                try:
+                    return str(datetime.timedelta(seconds=int(sec)))
+                except Exception:
+                    return "--:--"
+
+            segment_eta = (steps - current_step) * avg_step if avg_step else 0
+            total_eta = (total_steps - total_steps_done) * avg_step if avg_step else 0
+
+            segment_hint = f'Sampling {current_step}/{steps}  ETA {fmt_eta(segment_eta)}'
+            total_hint = f'Total {total_steps_done}/{total_steps}  ETA {fmt_eta(total_eta)}'
+
             current_pos = (total_generated_latent_frames * 4 - 3) / 30
             original_pos = total_second_length - current_pos
             if current_pos < 0: current_pos = 0
             if original_pos < 0: original_pos = 0
 
-            hint = f'Sampling {current_step}/{steps}'
-            if model_type == "Original":
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, ' \
-                       f'Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30):.2f} seconds (FPS-30). ' \
-                       f'Current position: {current_pos:.2f}s (original: {original_pos:.2f}s). ' \
-                       f'using prompt: {current_prompt[:256]}...'
-            else:  # F1 model
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, ' \
-                       f'Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30):.2f} seconds (FPS-30). ' \
-                       f'Current position: {current_pos:.2f}s. ' \
-                       f'using prompt: {current_prompt[:256]}...'
+            hint = segment_hint  # deprecated variable kept to minimise other code changes
+            desc = current_generator.format_position_description(
+                total_generated_latent_frames, 
+                current_pos, 
+                original_pos, 
+                current_prompt
+            )
 
             progress_data = {
                 'preview': preview,
                 'desc': desc,
-                'html': make_progress_bar_html(percentage, hint)
+                'html': make_progress_bar_html(percentage, segment_hint) + make_progress_bar_html(total_percentage, total_hint)
             }
             if job_stream is not None:
                 job = job_queue.get_job(job_id)
                 if job:
                     job.progress_data = progress_data
 
-            stream_to_use.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+            stream_to_use.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, segment_hint) + make_progress_bar_html(total_percentage, total_hint))))
 
         # --- Main generation loop ---
         for latent_padding in latent_paddings:
@@ -711,48 +646,29 @@ def worker(
                   f'time position: {current_time_position:.2f}s (original: {original_time_position:.2f}s), '
                   f'using prompt: {current_prompt[:60]}...')
 
-            if model_type == "Original":
-                # Original model uses the standard indices approach
-                indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-            else:  # F1 model
-                # F1 model uses a different indices approach
-                # latent_window_sizeが4.5の場合は特別に5を使用
-                effective_window_size = 5 if latent_window_size == 4.5 else int(latent_window_size)
-                indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
-                clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
-                clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
-                
-                print(f"F1 model indices: clean_latent_indices shape={clean_latent_indices.shape}, latent_indices shape={latent_indices.shape}")
+            # Prepare indices using the generator
+            clean_latent_indices, latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = current_generator.prepare_indices(latent_padding_size, latent_window_size)
 
-            if model_type == "Original":
-                clean_latents_pre = start_latent.to(history_latents)
-                clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-            else:  # F1 model
-                # For F1, we take the last frames for clean latents
-                clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
-                # For F1, we prepend the start latent to clean_latents_1x
-                clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
-                
-                # Print debug info for F1 model
-                print(f"F1 model section {section_idx+1}/{total_latent_sections}, latent_padding={latent_padding}")
+            # Prepare clean latents using the generator
+            clean_latents, clean_latents_2x, clean_latents_4x = current_generator.prepare_clean_latents(start_latent, history_latents)
+            
+            # Print debug info
+            print(f"{model_type} model section {section_idx+1}/{total_latent_sections}, latent_padding={latent_padding}")
 
             if not high_vram:
                 # Unload VAE etc. before loading transformer
                 unload_complete_models(vae, text_encoder, text_encoder_2, image_encoder)
-                move_model_to_device_with_memory_preservation(current_transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                move_model_to_device_with_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
                 if selected_loras:
-                    move_lora_adapters_to_device(current_transformer, gpu)
+                    current_generator.move_lora_adapters_to_device(gpu)
 
             if use_teacache:
-                current_transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+                current_generator.transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
             else:
-                current_transformer.initialize_teacache(enable_teacache=False)
+                current_generator.transformer.initialize_teacache(enable_teacache=False)
 
             generated_latents = sample_hunyuan(
-                transformer=current_transformer,
+                transformer=current_generator.transformer,
                 sampler='unipc',
                 width=width,
                 height=height,
@@ -782,47 +698,31 @@ def worker(
             )
 
             total_generated_latent_frames += int(generated_latents.shape[2])
-            if model_type == "Original":
-                history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
-            else:  # F1 model
-                # For F1, we append new frames to the end
-                history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+            # Update history latents using the generator
+            history_latents = current_generator.update_history_latents(history_latents, generated_latents)
 
             if not high_vram:
                 if selected_loras:
-                    move_lora_adapters_to_device(current_transformer, cpu)
-                offload_model_from_device_for_memory_preservation(current_transformer, target_device=gpu, preserved_memory_gb=8)
+                    current_generator.move_lora_adapters_to_device(cpu)
+                offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
                 load_model_as_complete(vae, target_device=gpu)
 
-            if model_type == "Original":
-                real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
-            else:  # F1 model
-                # For F1, we take frames from the end
-                real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+            # Get real history latents using the generator
+            real_history_latents = current_generator.get_real_history_latents(history_latents, total_generated_latent_frames)
 
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
-                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+                section_latent_frames = current_generator.get_section_latent_frames(latent_window_size, is_last_section)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                if model_type == "Original":
-                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                    history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
-                else:  # F1 model
-                    # For F1, we take frames from the end
-                    print(f"F1 model section {section_idx+1}/{total_latent_sections}, section_latent_frames={section_latent_frames}")
-                    print(f"F1 model real_history_latents shape: {real_history_latents.shape}, taking last {section_latent_frames} frames")
-                    
-                    # Get the frames from the end of real_history_latents
-                    current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
-                    
-                    print(f"F1 model current_pixels shape: {current_pixels.shape}, history_pixels shape: {history_pixels.shape if history_pixels is not None else 'None'}")
-                    
-                    # For F1 model, history_pixels is first, current_pixels is second
-                    history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
-                    
-                    print(f"F1 model after append, history_pixels shape: {history_pixels.shape}")
+                # Get current pixels using the generator
+                current_pixels = current_generator.get_current_pixels(real_history_latents, section_latent_frames, vae)
+                
+                # Update history pixels using the generator
+                history_pixels = current_generator.update_history_pixels(history_pixels, current_pixels, overlapped_frames)
+                
+                print(f"{model_type} model section {section_idx+1}/{total_latent_sections}, history_pixels shape: {history_pixels.shape}")
 
             if not high_vram:
                 unload_complete_models()
@@ -837,11 +737,10 @@ def worker(
 
             section_idx += 1  # PROMPT BLENDING: increment section index
 
-        # ADDED: Unload all LoRAs after generation completed
+        # Unload all LoRAs after generation completed
         if selected_loras:
             print("Unloading all LoRAs after generation completed")
-            current_transformer = lora_utils.unload_all_loras(current_transformer)
-            verify_lora_state(current_transformer, "After generation completed")
+            current_generator.unload_loras()
             import gc
             gc.collect()
             if torch.cuda.is_available():
@@ -849,11 +748,10 @@ def worker(
 
     except:
         traceback.print_exc()
-        # ADDED: Unload all LoRAs after error
-        if current_transformer is not None and selected_loras:
+        # Unload all LoRAs after error
+        if current_generator is not None and selected_loras:
             print("Unloading all LoRAs after error")
-            current_transformer = lora_utils.unload_all_loras(current_transformer)
-            verify_lora_state(current_transformer, "After error")
+            current_generator.unload_loras()
             import gc
             gc.collect()
             if torch.cuda.is_available():
@@ -863,7 +761,8 @@ def worker(
         if not high_vram:
             # Ensure all models including the potentially active transformer are unloaded on error
             unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, current_transformer
+                text_encoder, text_encoder_2, image_encoder, vae, 
+                current_generator.transformer if current_generator else None
             )
 
     if clean_up_videos:
@@ -893,8 +792,9 @@ def worker(
         except Exception as e:
             print(f"Error during video cleanup: {e}")
 
-    # ADDED: Final verification of LoRA state
-    verify_lora_state(current_transformer, "Worker end")
+    # Final verification of LoRA state
+    if current_generator and current_generator.transformer:
+        verify_lora_state(current_generator.transformer, "Worker end")
 
     stream_to_use.output_queue.push(('end', None))
     return
@@ -933,7 +833,9 @@ def process(
     
     # Create a blank black image if no 
     # Create a default image based on the selected latent_type
+    has_input_image = True
     if input_image is None:
+        has_input_image = False
         default_height, default_width = resolutionH, resolutionW
         if latent_type == "White":
             # Create a white image
@@ -980,6 +882,7 @@ def process(
         'save_metadata': save_metadata,
         'selected_loras': selected_loras,
         'clean_up_videos': clean_up_videos,
+        'has_input_image': has_input_image,
         'output_dir': settings.get("output_dir"),
         'metadata_dir': settings.get("metadata_dir"),
         'resolutionW': resolutionW, # Add resolution parameter
@@ -995,6 +898,11 @@ def process(
     
     # Add job to queue
     job_id = job_queue.add_job(job_params)
+    
+    # Set the generation_type attribute on the job object directly
+    job = job_queue.get_job(job_id)
+    if job:
+        job.generation_type = model_type  # Set generation_type to model_type for display in queue
     print(f"Added job {job_id} to queue")
     
     queue_status = update_queue_status()
