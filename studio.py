@@ -72,10 +72,18 @@ parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--lora", type=str, default=None, help="Lora path (comma separated for multiple)")
+parser.add_argument("--offline", action='store_true', help="Run in offline mode")
 args = parser.parse_args()
 
 print(args)
 
+if args.offline:
+    print("Offline mode enabled.")
+    os.environ['HF_HUB_OFFLINE'] = '1'
+else:
+    if 'HF_HUB_OFFLINE' in os.environ:
+        del os.environ['HF_HUB_OFFLINE']
+    
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
 
@@ -335,26 +343,68 @@ def worker(
 
         if model_type == "Original":
             if transformer_original is None:
-                print("Loading Original Transformer...")
-                transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
-                transformer_original.eval()
-                transformer_original.to(dtype=torch.bfloat16)
-                transformer_original.requires_grad_(False)
-                if not high_vram:
-                    DynamicSwapInstaller.install_model(transformer_original, device=gpu)
-                print("Original Transformer Loaded.")
+                # If [--offline] we'll attempt to load offline first, with online fallback
+                if args.offline:
+                    snapshot_hash_original = "86cef4396041b6002c957852daac4c91aaa47c79" 
+                    transformer_path = os.path.join(os.environ.get('HF_HOME'), 'hub', 'models--lllyasviel--FramePackI2V_HY', 'snapshots', snapshot_hash_original)
+                    if os.path.isdir(transformer_path):
+                        print(f"Loading Transformer in offline mode...")
+                        try:
+                            transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained(transformer_path, torch_dtype=torch.bfloat16).cpu()
+                            print("Successfully loaded Original Transformer in offline mode.")
+                        except Exception as e:
+                            print(f"Error loading Original Transformer from local path '{transformer_path}': {e}. Will attempt online.")
+                            transformer_original = None # reset as we're now falling back to the preexisting code
+                    else:
+                        print(f"Offline path for Original Transformer not found: {transformer_path}. Will attempt online.")
+
+                if transformer_original is None:
+                    print("Loading Original Transformer") 
+                    transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+
+                if transformer_original is not None: # Guard against total load failure
+                    transformer_original.eval()
+                    transformer_original.to(dtype=torch.bfloat16)
+                    transformer_original.requires_grad_(False)
+                    if not high_vram:
+                        DynamicSwapInstaller.install_model(transformer_original, device=gpu)
+                    print("Original Transformer Loaded.")
+                else:
+                    raise RuntimeError("Failed to load Original Transformer.")
+            
             target_transformer_model = transformer_original
             other_transformer_model = transformer_f1
+
         elif model_type == "F1":
             if transformer_f1 is None:
-                print("Loading F1 Transformer...")
-                transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
-                transformer_f1.eval()
-                transformer_f1.to(dtype=torch.bfloat16)
-                transformer_f1.requires_grad_(False)
-                if not high_vram:
-                    DynamicSwapInstaller.install_model(transformer_f1, device=gpu)
-                print("F1 Transformer Loaded.")
+                if args.offline:
+                    snapshot_hash_f1 = "ab239828e0b384fed75580f186f078717d4020f7" 
+                    transformer_path = os.path.join(os.environ.get('HF_HOME'), 'hub', 'models--lllyasviel--FramePack_F1_I2V_HY_20250503', 'snapshots', snapshot_hash_f1)
+                    if os.path.isdir(transformer_path):
+                        print(f"Attempting to load F1 Transformer in offline mode") 
+                        try:
+                            transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained(transformer_path, torch_dtype=torch.bfloat16).cpu()
+                            print("Successfully loaded F1 Transformer from local path.")
+                        except Exception as e:
+                            print(f"Error loading F1 Transformer from local path '{transformer_path}': {e}. Will attempt online.")
+                            transformer_f1 = None
+                    else:
+                        print(f"Offline path for F1 Transformer not found: {transformer_path}. Will attempt online.")
+
+                if transformer_f1 is None:
+                    print("Loading F1 Transformer...")
+                    transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
+
+                if transformer_f1 is not None:
+                    transformer_f1.eval()
+                    transformer_f1.to(dtype=torch.bfloat16)
+                    transformer_f1.requires_grad_(False)
+                    if not high_vram:
+                        DynamicSwapInstaller.install_model(transformer_f1, device=gpu)
+                    print("F1 Transformer Loaded.") 
+                else:
+                    raise RuntimeError("Failed to load F1 Transformer.")
+            
             target_transformer_model = transformer_f1
             other_transformer_model = transformer_original
         else:
