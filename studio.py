@@ -100,6 +100,35 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
+
+def get_snapshot_hash_from_refs(model_repo_id_for_cache: str) -> str | None:
+    """
+    Reads the commit hash from the refs/main file for a given model in the HF cache.
+    Args:
+        model_repo_id_for_cache (str): The model ID formatted for cache directory names
+                                       (e.g., "models--lllyasviel--FramePackI2V_HY").
+    Returns:
+        str: The commit hash if found, otherwise None.
+    """
+    hf_home_dir = os.environ.get('HF_HOME')
+    if not hf_home_dir:
+        print("Warning: HF_HOME environment variable not set. Cannot determine snapshot hash.")
+        return None
+        
+    refs_main_path = os.path.join(hf_home_dir, 'hub', model_repo_id_for_cache, 'refs', 'main')
+    if os.path.exists(refs_main_path):
+        try:
+            with open(refs_main_path, 'r') as f:
+                return f.read().strip()
+        except Exception as e:
+            print(f"Warning: Could not read snapshot hash from {refs_main_path}: {e}")
+            return None
+    else:
+        # This case is important: if refs/main doesn't exist, we can't get the hash.
+        print(f"Warning: refs/main file not found at {refs_main_path}. Cannot determine snapshot hash.")
+        return None
+
+
 # Initialize transformer placeholders
 transformer_original = None
 transformer_f1 = None
@@ -343,24 +372,33 @@ def worker(
 
         if model_type == "Original":
             if transformer_original is None:
-                # If [--offline] we'll attempt to load offline first, with online fallback
                 if args.offline:
-                    snapshot_hash_original = "86cef4396041b6002c957852daac4c91aaa47c79" 
-                    transformer_path = os.path.join(os.environ.get('HF_HOME'), 'hub', 'models--lllyasviel--FramePackI2V_HY', 'snapshots', snapshot_hash_original)
-                    if os.path.isdir(transformer_path):
-                        print(f"Loading Transformer in offline mode...")
-                        try:
-                            transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained(transformer_path, torch_dtype=torch.bfloat16).cpu()
-                            print("Successfully loaded Original Transformer in offline mode.")
-                        except Exception as e:
-                            print(f"Error loading Original Transformer from local path '{transformer_path}': {e}. Will attempt online.")
-                            transformer_original = None # reset as we're now falling back to the preexisting code
+                    snapshot_hash_original = get_snapshot_hash_from_refs("models--lllyasviel--FramePackI2V_HY")
+                    if snapshot_hash_original: # Check if hash was successfully retrieved
+                        transformer_path = os.path.join(os.environ.get('HF_HOME'), 'hub', 'models--lllyasviel--FramePackI2V_HY', 'snapshots', snapshot_hash_original)
+                        if os.path.isdir(transformer_path):
+                            print(f"Attempting to load Original Transformer in offline mode (snapshot: {snapshot_hash_original[:7]}).") # Show partial hash
+                            try:
+                                transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+                                    transformer_path, torch_dtype=torch.bfloat16
+                                ).cpu()
+                                print("Successfully loaded Original Transformer in offline mode.")
+                            except Exception as e:
+                                print(f"Error loading Original Transformer offline (snapshot: {snapshot_hash_original[:7]}). Will attempt online.")
+                                transformer_original = None 
+                        else:
+                            print(f"Offline snapshot path for Original Transformer not found: {transformer_path}. Will attempt online.")
+                            # This implies refs/main existed, but the snapshot dir itself is missing.
                     else:
-                        print(f"Offline path for Original Transformer not found: {transformer_path}. Will attempt online.")
+                        # snapshot_hash_original is None (refs/main not found or unreadable)
+                        print(f"Could not determine snapshot hash for Original Transformer for offline mode. Will attempt online.")
+                        # transformer_original remains None
 
                 if transformer_original is None:
-                    print("Loading Original Transformer") 
-                    transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+                    print("Loading Original Transformer...") 
+                    transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+                        'lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16
+                    ).cpu()
 
                 if transformer_original is not None: # Guard against total load failure
                     transformer_original.eval()
@@ -378,22 +416,29 @@ def worker(
         elif model_type == "F1":
             if transformer_f1 is None:
                 if args.offline:
-                    snapshot_hash_f1 = "ab239828e0b384fed75580f186f078717d4020f7" 
-                    transformer_path = os.path.join(os.environ.get('HF_HOME'), 'hub', 'models--lllyasviel--FramePack_F1_I2V_HY_20250503', 'snapshots', snapshot_hash_f1)
-                    if os.path.isdir(transformer_path):
-                        print(f"Attempting to load F1 Transformer in offline mode") 
-                        try:
-                            transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained(transformer_path, torch_dtype=torch.bfloat16).cpu()
-                            print("Successfully loaded F1 Transformer from local path.")
-                        except Exception as e:
-                            print(f"Error loading F1 Transformer from local path '{transformer_path}': {e}. Will attempt online.")
-                            transformer_f1 = None
+                    snapshot_hash_f1 = get_snapshot_hash_from_refs("models--lllyasviel--FramePack_F1_I2V_HY_20250503")
+                    if snapshot_hash_f1: # Check if hash was successfully retrieved
+                        transformer_path = os.path.join(os.environ.get('HF_HOME'), 'hub', 'models--lllyasviel--FramePack_F1_I2V_HY_20250503', 'snapshots', snapshot_hash_f1)
+                        if os.path.isdir(transformer_path):
+                            print(f"Attempting to load F1 Transformer in offline mode (snapshot: {snapshot_hash_f1[:7]}).")
+                            try:
+                                transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+                                    transformer_path, torch_dtype=torch.bfloat16
+                                ).cpu()
+                                print("Successfully loaded F1 Transformer from local path.")
+                            except Exception as e:
+                                print(f"Error loading F1 Transformer from local path (snapshot: {snapshot_hash_f1[:7]}): {e}. Will attempt online.")
+                                transformer_f1 = None 
+                        else:
+                            print(f"Offline snapshot path for F1 Transformer not found: {transformer_path}. Will attempt online.")
                     else:
-                        print(f"Offline path for F1 Transformer not found: {transformer_path}. Will attempt online.")
+                        print(f"Could not determine snapshot hash for F1 Transformer for offline mode. Will attempt online.")
 
                 if transformer_f1 is None:
                     print("Loading F1 Transformer...")
-                    transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
+                    transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+                        'lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16
+                    ).cpu()
 
                 if transformer_f1 is not None:
                     transformer_f1.eval()
