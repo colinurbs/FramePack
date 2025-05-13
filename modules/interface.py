@@ -185,8 +185,8 @@ def create_interface(
                                 save_metadata = gr.Checkbox(label="Save Metadata", value=True, info="Save to JSON file")
                             with gr.Row("TeaCache"):
                                 use_teacache = gr.Checkbox(label='Use TeaCache', value=False, info='Faster speed, but often makes hands and fingers slightly worse.')
-                                teacache_num_steps = gr.Slider(label="TeaCache steps", minimum=1, maximum=50, step=1, value=25, visible=False, info='Сколько промежуточных секций держать в кэше')
-                                teacache_rel_l1_thresh = gr.Slider(label="TeaCache rel_l1_thresh", minimum=0.01, maximum=1.0, step=0.01, value=0.15, visible=False, info='Порог L1-расхождения')
+                                teacache_num_steps = gr.Slider(label="TeaCache steps", minimum=1, maximum=50, step=1, value=25, visible=False, info='Number of intermediate steps for the cache')
+                                teacache_rel_l1_thresh = gr.Slider(label="TeaCache rel_l1_thresh", minimum=0.01, maximum=1.0, step=0.01, value=0.15, visible=False, info='Relative L1 divergence threshold')
                                 use_teacache.change(lambda enabled: (gr.update(visible=enabled), gr.update(visible=enabled)), inputs=use_teacache, outputs=[teacache_num_steps, teacache_rel_l1_thresh])
                                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
 
@@ -288,8 +288,8 @@ def create_interface(
                                 f1_save_metadata = gr.Checkbox(label="Save Metadata", value=True, info="Save to JSON file")
                             with gr.Row("TeaCache"):
                                 f1_use_teacache = gr.Checkbox(label='Use TeaCache', value=False, info='Faster speed, but often makes hands and fingers slightly worse.')
-                                f1_teacache_num_steps = gr.Slider(label="TeaCache num_steps", minimum=1, maximum=50, step=1, value=25, visible=False, info='Количество промежуточных шагов для кэша')
-                                f1_teacache_rel_l1_thresh = gr.Slider(label="TeaCache rel_l1_thresh", minimum=0.01, maximum=1.0, step=0.01, value=0.15, visible=False, info='Порог L1-расхождения')
+                                f1_teacache_num_steps = gr.Slider(label="TeaCache num_steps", minimum=1, maximum=50, step=1, value=25, visible=False, info='Number of intermediate steps for the cache')
+                                f1_teacache_rel_l1_thresh = gr.Slider(label="TeaCache rel_l1_thresh", minimum=0.01, maximum=1.0, step=0.01, value=0.15, visible=False, info='Relative L1 divergence threshold')
                                 f1_use_teacache.change(lambda enabled: (gr.update(visible=enabled), gr.update(visible=enabled)), inputs=f1_use_teacache, outputs=[f1_teacache_num_steps, f1_teacache_rel_l1_thresh])
                                 f1_n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True)
 
