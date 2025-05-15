@@ -60,7 +60,7 @@ def create_interface(
     .contain-image * img {
         object-fit: contain !important;
         width: 100% !important;
-        height: 100% !important;
+        height: 60vh !important; # Switched to 60vh (viewport height) to prevent image cropping at 100% and improve scaling.
         max-height: 100% !important;
         max-width: 100% !important;
     }
@@ -142,7 +142,7 @@ def create_interface(
                             sources='upload',
                             type="numpy",
                             label="Image (optional)",
-                            height=420,
+                            # height=420, # Commented out to allow CSS (vh) to manage image height.
                             elem_classes="contain-image",
                             image_mode="RGB",
                             show_download_button=False,
