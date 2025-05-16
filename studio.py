@@ -262,6 +262,8 @@ def get_cached_or_encode_prompt(prompt, text_encoder, text_encoder_2, tokenizer,
 def worker(
     model_type,
     input_image,
+    end_frame_image,     # NEW: The end frame image (numpy array or None)
+    end_frame_strength,  # NEW: Influence of the end frame
     prompt_text, 
     n_prompt, 
     seed, 
@@ -460,7 +462,9 @@ def worker(
                     "timestamp": time.time(),
                     "resolutionW": resolutionW,  # Add resolution to metadata
                     "resolutionH": resolutionH,
-                    "model_type": model_type  # Add model type to metadata
+                    "model_type": model_type,  # Add model type to metadata
+                    "end_frame_strength": end_frame_strength if end_frame_image is not None else None,
+                    "end_frame_used": True if end_frame_image is not None else False,                    
                 }
             # Add LoRA information to metadata if LoRAs are used
             def ensure_list(x):
@@ -556,6 +560,38 @@ def worker(
             image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
             image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
+        # NEW: VAE encode end_frame_image if provided (Original Model only for now)
+        end_frame_latent = None
+        if model_type == "Original" and end_frame_image is not None:
+            print("Processing end frame for Original model...")
+            if not isinstance(end_frame_image, np.ndarray):
+                print(f"Warning: end_frame_image is not a numpy array (type: {type(end_frame_image)}). Attempting conversion or skipping.")
+                try:
+                    end_frame_image = np.array(end_frame_image)
+                except Exception as e_conv:
+                    print(f"Could not convert end_frame_image to numpy array: {e_conv}. Skipping end frame.")
+                    end_frame_image = None
+            
+            if end_frame_image is not None:
+                # Use the main job's target width/height (bucket dimensions) for the end frame
+                # `width` and `height` should be available from the start_image processing
+                end_frame_np = resize_and_center_crop(end_frame_image, target_width=width, target_height=height)
+                
+                if settings.get("save_metadata"): # Save processed end frame for debugging
+                     Image.fromarray(end_frame_np).save(os.path.join(metadata_dir, f'{job_id}_end_frame_processed.png'))
+                
+                end_frame_pt = torch.from_numpy(end_frame_np).float() / 127.5 - 1
+                end_frame_pt = end_frame_pt.permute(2, 0, 1)[None, :, None] # VAE expects [B, C, F, H, W]
+                
+                if not high_vram: load_model_as_complete(vae, target_device=gpu) # Ensure VAE is loaded
+                end_frame_latent = vae_encode(end_frame_pt, vae)
+                print("End frame VAE encoded.")
+                # VAE will be offloaded later if not high_vram, after prompt dtype conversions.
+        
+        if not high_vram: # Offload VAE and image_encoder if they were loaded
+            offload_model_from_device_for_memory_preservation(vae, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+            offload_model_from_device_for_memory_preservation(image_encoder, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+        
         # Dtype
         for prompt_key in encoded_prompts:
             llama_vec, llama_attention_mask, clip_l_pooler = encoded_prompts[prompt_key]
@@ -680,7 +716,8 @@ def worker(
             stream_to_use.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, segment_hint) + make_progress_bar_html(total_percentage, total_hint))))
 
         # --- Main generation loop ---
-        for latent_padding in latent_paddings:
+        # `i_section_loop` will be our loop counter for applying end_frame_latent
+        for i_section_loop, latent_padding in enumerate(latent_paddings): # Existing loop structure
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
@@ -761,6 +798,26 @@ def worker(
                   f'time position: {current_time_position:.2f}s (original: {original_time_position:.2f}s), '
                   f'using prompt: {current_prompt[:60]}...')
 
+            # Apply end_frame_latent to history_latents for Original model
+            if model_type == "Original" and i_section_loop == 0 and end_frame_latent is not None:
+                print(f"Applying end_frame_latent to history_latents with strength: {end_frame_strength}")
+                actual_end_frame_latent_for_history = end_frame_latent.clone()
+                if end_frame_strength != 1.0: # Only multiply if not full strength
+                    actual_end_frame_latent_for_history = actual_end_frame_latent_for_history * end_frame_strength
+                
+                # Ensure history_latents is on the correct device (usually CPU for this kind of modification if it's init'd there)
+                # and that the assigned tensor matches its dtype.
+                # The `current_generator.prepare_history_latents` initializes it on CPU with float32.
+                if history_latents.shape[2] >= 1: # Check if the 'Depth_slots' dimension is sufficient
+                    history_latents[:, :, 0:1, :, :] = actual_end_frame_latent_for_history.to(
+                        device=history_latents.device, # Assign to history_latents' current device
+                        dtype=history_latents.dtype    # Match history_latents' dtype
+                    )
+                    print("End frame latent applied to history.")
+                else:
+                    print("Warning: history_latents not shaped as expected for end_frame application.")
+            
+            
             # Prepare indices using the generator
             clean_latent_indices, latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = current_generator.prepare_indices(latent_padding_size, latent_window_size)
 
@@ -937,6 +994,8 @@ job_queue.set_worker_function(worker)
 def process(
         model_type,
         input_image,
+        end_frame_image,     # NEW
+        end_frame_strength,  # NEW        
         prompt_text,
         n_prompt,
         seed, 
@@ -993,6 +1052,8 @@ def process(
     job_params = {
         'model_type': model_type,
         'input_image': input_image.copy() if hasattr(input_image, 'copy') else input_image,  # Handle both image arrays and video paths
+        'end_frame_image': end_frame_image.copy() if end_frame_image is not None else None,
+        'end_frame_strength': end_frame_strength,        
         'prompt_text': prompt_text,
         'n_prompt': n_prompt,
         'seed': seed,

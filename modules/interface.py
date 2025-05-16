@@ -125,9 +125,6 @@ def create_interface(
             with gr.Column(scale=0):
                 refresh_stats_btn = gr.Button("⟳", elem_id="refresh-stats-btn")
 
-
-        
-
         with gr.Tabs():
             with gr.Tab("Generate", id="generate_tab"):
                 with gr.Row():
@@ -138,19 +135,46 @@ def create_interface(
                             label="Model",
                             info="Select which model to use for generation"
                         )
-                        with gr.Group(visible=True) as image_input_group:
-                            input_image = gr.Image(
-                                sources='upload',
-                                type="numpy",
-                                label="Image (optional)",
-                                height=420,
-                                elem_classes="contain-image",
-                                image_mode="RGB",
-                                show_download_button=False,
-                                show_label=True,
-                                container=True
-                            )
-                        
+                        with gr.Tabs():
+                            with gr.TabItem("Start Frame"):
+                                # Default visibility: True because "Original" model is not "Video"
+                                with gr.Group(visible=True) as image_input_group: 
+                                    input_image = gr.Image(
+                                        sources='upload',
+                                        type="numpy",
+                                        label="Start Frame (optional)",
+                                        height=420,
+                                        elem_classes="contain-image",
+                                        image_mode="RGB",
+                                        show_download_button=False,
+                                        show_label=True, # Keep label for clarity
+                                        container=True
+                                    )
+                    
+                            # NEW: End Frame TabItem
+                            with gr.TabItem("End Frame (Original Model)"): 
+                                # Initial visibility: True because model_type.value ("Original" by default) IS "Original"
+                                with gr.Group(visible=(model_type.value == "Original")) as end_frame_group_original:
+                                    end_frame_image_original = gr.Image(
+                                        sources='upload',
+                                        type="numpy",
+                                        label="End Frame (Optional)", 
+                                        height=420, 
+                                        elem_classes="contain-image",
+                                        image_mode="RGB",
+                                        show_download_button=False,
+                                        show_label=True,
+                                        container=True
+                                    )
+                                    end_frame_strength_original = gr.Slider(
+                                        label="End Frame Influence",
+                                        minimum=0.05,
+                                        maximum=1.0,
+                                        value=1.0,
+                                        step=0.05,
+                                        info="Controls how strongly the end frame guides the generation (Original model only). 1.0 is full influence."
+                                    )
+                    
                         with gr.Group(visible=False) as video_input_group:
                             input_video = gr.Video(
                                 sources='upload',
@@ -163,20 +187,33 @@ def create_interface(
                                 value=True,
                                 info="If checked, the source video will be combined with the generated video"
                             )
-                        
-                        # Show/hide video or image input based on model selection
-                        def update_input_visibility(model_choice):
-                            if model_choice == "Video":
-                                return gr.update(visible=False), gr.update(visible=True)
-                            else:
-                                return gr.update(visible=True), gr.update(visible=False)
-                        
+                    
+                        # Show/hide input groups based on model selection
+                        def update_input_visibility(model_choice_value):
+                            is_video_model = (model_choice_value == "Video")
+                            is_original_model = (model_choice_value == "Original")
+                            
+                            # Visibility for image_input_group (content of "Start Frame" tab)
+                            image_input_grp_visible = not is_video_model # Visible for "Original" and "F1"
+
+                            # Visibility for video_input_group
+                            video_input_grp_visible = is_video_model
+
+                            # Visibility for end_frame_group_original (content of "End Frame" tab)
+                            end_frame_grp_visible = is_original_model # Visible only for "Original" model
+
+                            return (
+                                gr.update(visible=image_input_grp_visible),    # For image_input_group
+                                gr.update(visible=video_input_grp_visible),    # For video_input_group
+                                gr.update(visible=end_frame_grp_visible)       # For end_frame_group_original
+                            )
+
                         model_type.change(
                             fn=update_input_visibility,
                             inputs=[model_type],
-                            outputs=[image_input_group, video_input_group]
+                            outputs=[image_input_group, video_input_group, end_frame_group_original] # Added end_frame_group_original
                         )
-
+                        
                         with gr.Accordion("Latent Image Options", open=False):
                             latent_type = gr.Dropdown(
                                 ["Black", "White", "Noise", "Green Screen"], label="Latent Image", value="Black", info="Used as a starting point if no image is provided"
@@ -485,17 +522,25 @@ def create_interface(
         # Connect the main process function (wrapper for adding to queue)
         def process_with_queue_update(model_type, *args):
             # Extract all arguments (ensure order matches inputs lists)
-            input_image, input_video, prompt_text, n_prompt, seed_value, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, teacache_num_steps, teacache_rel_l1_thresh, mp4_crf, randomize_seed_checked, save_metadata_checked, blend_sections, latent_type, clean_up_videos, selected_loras, resolutionW, resolutionH, *lora_args = args
+            input_image, input_video, end_frame_image_original, end_frame_strength_original, prompt_text, n_prompt, seed_value, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, teacache_num_steps, teacache_rel_l1_thresh, mp4_crf, randomize_seed_checked, save_metadata_checked, blend_sections, latent_type, clean_up_videos, selected_loras, resolutionW, resolutionH, *lora_args = args
 
             # DO NOT parse the prompt here. Parsing happens once in the worker.
 
             # Use the appropriate input based on model type
             input_data = input_video if model_type == "Video" else input_image
             
+            # NEW: Define actual end_frame params to pass to backend
+            actual_end_frame_image_for_backend = None
+            actual_end_frame_strength_for_backend = 1.0  # Default strength
+
+            if model_type == "Original":
+                actual_end_frame_image_for_backend = end_frame_image_original # Use the unpacked value
+                actual_end_frame_strength_for_backend = end_frame_strength_original # Use the unpacked value
+
             # Use the current seed value as is for this job
             # Call the process function with all arguments
             # Pass the model_type and the ORIGINAL prompt_text string to the backend process function
-            result = process_fn(model_type, input_data, prompt_text, n_prompt, seed_value, total_second_length, # Pass original prompt_text string
+            result = process_fn(model_type, input_data, actual_end_frame_image_for_backend, actual_end_frame_strength_for_backend, prompt_text, n_prompt, seed_value, total_second_length, # Pass original prompt_text string
                             latent_window_size, steps, cfg, gs, rs,
                             use_teacache, teacache_num_steps, teacache_rel_l1_thresh, blend_sections, latent_type, clean_up_videos, selected_loras, resolutionW, resolutionH, *lora_args)
 
@@ -533,6 +578,8 @@ def create_interface(
         ips = [
             input_image,
             input_video,
+            end_frame_image_original,    # NEW
+            end_frame_strength_original, # NEW
             prompt,
             n_prompt,
             seed,
@@ -643,7 +690,8 @@ def create_interface(
                 prompt_val = metadata.get('prompt')
                 seed_val = metadata.get('seed')
                 total_second_length_val = metadata.get('total_second_length')  # Get total_second_length
-
+                end_frame_strength_val = metadata.get('end_frame_strength') # Load end_frame_strength if present in metadata
+                
                 # Check for LoRA values in metadata
                 lora_weights = metadata.get('loras', {}) # Changed key to 'loras' based on studio.py worker
 
@@ -654,7 +702,8 @@ def create_interface(
                 updates = [
                     gr.update(value=prompt_val) if prompt_val else gr.update(),
                     gr.update(value=seed_val) if seed_val is not None else gr.update(),
-                    gr.update(value=total_second_length_val) if total_second_length_val is not None else gr.update()  # Add total_second_length update
+                    gr.update(value=total_second_length_val) if total_second_length_val is not None else gr.update(),  # Add total_second_length update
+                    gr.update(value=end_frame_strength_val) if end_frame_strength_val is not None else gr.update(),  # Add update for end_frame_strength_original slider
                 ]
 
                 # Update LoRA sliders if they exist in metadata
@@ -678,7 +727,7 @@ def create_interface(
         json_upload.change(
             fn=load_metadata_from_json,
             inputs=[json_upload],
-            outputs=[prompt, seed, total_second_length] + [lora_sliders[lora] for lora in lora_names]
+            outputs=[prompt, seed, total_second_length, end_frame_strength_original] + [lora_sliders[lora] for lora in lora_names]
         )
 
 
