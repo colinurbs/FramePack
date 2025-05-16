@@ -169,11 +169,12 @@ lora_folder_from_settings: str = settings.get("lora_dir", default_lora_folder) #
 print(f"Scanning for LoRAs in: {lora_folder_from_settings}")
 if os.path.isdir(lora_folder_from_settings):
     try:
-        lora_files = [f for f in os.listdir(lora_folder_from_settings)
-                     if f.endswith('.safetensors') or f.endswith('.pt')]
-        for lora_file in lora_files:
-            lora_name = PurePath(lora_file).stem
-            lora_names.append(lora_name) # Get name without extension
+        for root, _, files in os.walk(lora_folder_from_settings):
+            for file in files:
+                if file.endswith('.safetensors') or file.endswith('.pt'):
+                    lora_relative_path = os.path.relpath(os.path.join(root, file), lora_folder_from_settings)
+                    lora_name = str(PurePath(lora_relative_path).with_suffix(''))
+                    lora_names.append(lora_name)
         print(f"Found LoRAs: {lora_names}")
     except Exception as e:
         print(f"Error scanning LoRA directory '{lora_folder_from_settings}': {e}")

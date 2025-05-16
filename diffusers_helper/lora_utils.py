@@ -37,7 +37,7 @@ def load_lora(transformer, lora_path: Path, weight_name: Optional[str] = "pytorc
     # For now, we assume it is never None
     # The module name in the state_dict must not include a . in the name
     # See https://github.com/pytorch/pytorch/pull/6639/files#diff-4be56271f7bfe650e3521c81fd363da58f109cd23ee80d243156d2d6ccda6263R133-R134
-    adapter_name = PurePath(str(weight_name).replace('_DOT_', '.')).stem.replace('.', '_DOT_')
+    adapter_name = str(PurePath(weight_name).with_suffix('')).replace('.', '_DOT_')
     if '_DOT_' in adapter_name:
         print(
             f"LoRA file '{weight_name}' contains a '.' in the name. " +

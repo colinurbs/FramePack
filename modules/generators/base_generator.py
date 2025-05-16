@@ -245,21 +245,20 @@ class BaseModelGenerator(ABC):
                 idx = lora_loaded_names.index(lora_name)
                 lora_file = None
                 for ext in [".safetensors", ".pt"]:
-                    # Find any file that starts with the lora_name and ends with the extension
-                    matching_files = [f for f in os.listdir(lora_folder) 
-                                   if f.startswith(lora_name) and f.endswith(ext)]
-                    if matching_files:
-                        lora_file = matching_files[0]  # Use the first matching file
+                    candidate_path_relative = f"{lora_name}{ext}"
+                    candidate_path_full = os.path.join(lora_folder, candidate_path_relative)
+                    if os.path.isfile(candidate_path_full):
+                        lora_file = candidate_path_relative
                         break
                         
                 if lora_file:
-                    print(f"Loading LoRA {lora_file} to {self.get_model_name()} model")
+                    print(f"Loading LoRA '{lora_file}' to {self.get_model_name()} model")
                     self.transformer = lora_utils.load_lora(self.transformer, lora_folder, lora_file)
                     
                     # Set LoRA strength if provided
                     if lora_values and idx < len(lora_values):
                         lora_strength = float(lora_values[idx])
-                        print(f"Setting LoRA {lora_name} strength to {lora_strength}")
+                        print(f"Setting LoRA '{lora_name}' strength to {lora_strength}")
                         
                         # Set scaling for this LoRA by iterating through modules
                         for name, module in self.transformer.named_modules():
