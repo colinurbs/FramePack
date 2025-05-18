@@ -38,6 +38,8 @@ Install via the Pinokio community script "FP-Studio" or:
    pip install -r requirements.txt
    ```
 
+3. If you are migrating from other projects or have your models already downloaded, you can put the paths in the provided `.env` file. Just open with any text editor and change your existing directories. If they are not valid the script will autodownload the models.
+
 ## Usage
 
 Run the studio interface:

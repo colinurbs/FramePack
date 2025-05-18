@@ -9,7 +9,6 @@ import einops
 import numpy as np
 import torch
 
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 import gradio as gr
 from PIL import Image
@@ -34,6 +33,31 @@ from modules.video_queue import VideoJobQueue, JobStatus
 from modules.prompt_handler import parse_timestamped_prompt
 from modules.interface import create_interface, format_queue_status
 from modules.settings import Settings
+
+
+from dotenv import load_dotenv
+# Load .env from the current directory
+load_dotenv()
+# Define variable names and their fallback values
+local_hf_home= os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+fallbacks = {
+    "PATH_MODEL_HunyuanVideo": "hunyuanvideo-community/HunyuanVideo",
+    "PATH_MODEL_flux_redux_bfl": "lllyasviel/flux_redux_bfl",
+    "PATH_MODEL_FramePack_F1_I2V_HY_20250503": "lllyasviel/FramePack_F1_I2V_HY_20250503",
+    "PATH_MODEL_FramePackI2V_HY": "lllyasviel/FramePackI2V_HY",
+    "HF_HOME" : f"{local_hf_home}"
+}
+# Dictionary to hold resolved paths
+resolved_paths = {}
+for var, fallback in fallbacks.items():
+    path = os.getenv(var)
+    if path and os.path.isdir(path):
+        resolved_paths[var] = path
+    else:
+        resolved_paths[var] = fallback
+
+os.environ['HF_HOME'] = resolved_paths["HF_HOME"]
+
 
 # ADDED: Debug function to verify LoRA state
 def verify_lora_state(transformer, label=""):
@@ -83,14 +107,16 @@ print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
 # Load models
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+text_encoder = LlamaModel.from_pretrained(resolved_paths["PATH_MODEL_HunyuanVideo"], subfolder='text_encoder', torch_dtype=torch.float16).cpu()
+text_encoder_2 = CLIPTextModel.from_pretrained(resolved_paths["PATH_MODEL_HunyuanVideo"], subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+tokenizer = LlamaTokenizerFast.from_pretrained(resolved_paths["PATH_MODEL_HunyuanVideo"], subfolder='tokenizer')
+tokenizer_2 = CLIPTokenizer.from_pretrained(resolved_paths["PATH_MODEL_HunyuanVideo"], subfolder='tokenizer_2')
+vae = AutoencoderKLHunyuanVideo.from_pretrained(resolved_paths["PATH_MODEL_HunyuanVideo"], subfolder='vae', torch_dtype=torch.float16).cpu()
+
+feature_extractor = SiglipImageProcessor.from_pretrained(resolved_paths["PATH_MODEL_flux_redux_bfl"], subfolder='feature_extractor')
+image_encoder = SiglipVisionModel.from_pretrained(resolved_paths["PATH_MODEL_flux_redux_bfl"], subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+
 
 # Initialize transformer placeholders
 transformer_original = None
@@ -336,7 +362,7 @@ def worker(
         if model_type == "Original":
             if transformer_original is None:
                 print("Loading Original Transformer...")
-                transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+                transformer_original = HunyuanVideoTransformer3DModelPacked.from_pretrained(resolved_paths["PATH_MODEL_FramePackI2V_HY"], torch_dtype=torch.bfloat16).cpu()
                 transformer_original.eval()
                 transformer_original.to(dtype=torch.bfloat16)
                 transformer_original.requires_grad_(False)
@@ -348,7 +374,7 @@ def worker(
         elif model_type == "F1":
             if transformer_f1 is None:
                 print("Loading F1 Transformer...")
-                transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
+                transformer_f1 = HunyuanVideoTransformer3DModelPacked.from_pretrained(resolved_paths["PATH_MODEL_FramePack_F1_I2V_HY_20250503"], torch_dtype=torch.bfloat16).cpu()
                 transformer_f1.eval()
                 transformer_f1.to(dtype=torch.bfloat16)
                 transformer_f1.requires_grad_(False)
