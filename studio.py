@@ -150,7 +150,11 @@ os.makedirs(default_lora_folder, exist_ok=True) # Ensure default exists
 
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+    # DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+    text_encoder.to(gpu)
+    text_encoder_2.to(gpu)
+    image_encoder.to(gpu)
+    vae.to(gpu)
 else:
     text_encoder.to(gpu)
     text_encoder_2.to(gpu)
@@ -324,9 +328,10 @@ def worker(
     try:
         if not high_vram:
             # Unload everything *except* the potentially active transformer
-            unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae)
+            # unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae)
             if current_generator is not None and current_generator.transformer is not None:
-                offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
+                # offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
+                pass # Keep transformer on GPU
 
         # --- Model Loading / Switching ---
         print(f"Worker starting for model type: {model_type}")
@@ -361,7 +366,7 @@ def worker(
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding all prompts...'))))
 
         if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)
+            # fake_diffusers_current_device(text_encoder, gpu) # Commented out as per request
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
         # PROMPT BLENDING: Pre-encode all prompts and store in a list in order
@@ -588,6 +593,10 @@ def worker(
                 load_model_as_complete(vae, target_device=gpu)
 
             start_latent = vae_encode(input_image_pt, vae)
+            if torch.isinf(start_latent).any() or torch.isnan(start_latent).any():
+                print(f"Warning: start_latent contains NaN/inf values. Clamping to a safe range. Min: {start_latent.min()}, Max: {start_latent.max()}")
+                start_latent = torch.nan_to_num(start_latent, nan=0.0, posinf=20.0, neginf=-20.0)
+                print(f"After clamping: Min: {start_latent.min()}, Max: {start_latent.max()}")
 
             # CLIP Vision
             stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
@@ -623,12 +632,18 @@ def worker(
                 
                 if not high_vram: load_model_as_complete(vae, target_device=gpu) # Ensure VAE is loaded
                 end_frame_latent = vae_encode(end_frame_pt, vae)
+                if end_frame_latent is not None: # Ensure it was created
+                    if torch.isinf(end_frame_latent).any() or torch.isnan(end_frame_latent).any():
+                        print(f"Warning: end_frame_latent contains NaN/inf values. Clamping to a safe range. Min: {end_frame_latent.min()}, Max: {end_frame_latent.max()}")
+                        end_frame_latent = torch.nan_to_num(end_frame_latent, nan=0.0, posinf=20.0, neginf=-20.0)
+                        print(f"After clamping: Min: {end_frame_latent.min()}, Max: {end_frame_latent.max()}")
                 print("End frame VAE encoded.")
                 # VAE will be offloaded later if not high_vram, after prompt dtype conversions.
         
         if not high_vram: # Offload VAE and image_encoder if they were loaded
-            offload_model_from_device_for_memory_preservation(vae, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
-            offload_model_from_device_for_memory_preservation(image_encoder, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+            # offload_model_from_device_for_memory_preservation(vae, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+            # offload_model_from_device_for_memory_preservation(image_encoder, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+            pass # Keep VAE and image_encoder on GPU
         
         # Dtype
         for prompt_key in encoded_prompts:
@@ -868,7 +883,7 @@ def worker(
             if not high_vram:
                 # Unload VAE etc. before loading transformer
                 unload_complete_models(vae, text_encoder, text_encoder_2, image_encoder)
-                move_model_to_device_with_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+                move_model_to_device_with_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=0)
                 if selected_loras:
                     current_generator.move_lora_adapters_to_device(gpu)
 
@@ -913,9 +928,11 @@ def worker(
 
             if not high_vram:
                 if selected_loras:
-                    current_generator.move_lora_adapters_to_device(cpu)
-                offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
+                    current_generator.move_lora_adapters_to_device(cpu) # Moving LoRAs to CPU is fine for VRAM preservation if needed during swap
+                # offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
+                # Ensure VAE is loaded (it should be already if not offloaded)
                 load_model_as_complete(vae, target_device=gpu)
+
 
             # Get real history latents using the generator
             real_history_latents = current_generator.get_real_history_latents(history_latents, total_generated_latent_frames)

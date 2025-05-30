@@ -71,12 +71,8 @@ class VideoModelGenerator(BaseModelGenerator):
         self.transformer.to(dtype=torch.bfloat16)
         self.transformer.requires_grad_(False)
         
-        # Set up dynamic swap if not in high VRAM mode
-        if not self.high_vram:
-            DynamicSwapInstaller.install_model(self.transformer, device=self.gpu)
-        else:
-            # In high VRAM mode, move the entire model to GPU
-            self.transformer.to(device=self.gpu)
+        # Always move transformer to GPU after initial setup on CPU
+        self.transformer.to(device=self.gpu)
         
         print(f"{self.model_name} Transformer Loaded from {path_to_load}.")
         return self.transformer
@@ -153,6 +149,26 @@ class VideoModelGenerator(BaseModelGenerator):
             if num_frames != num_real_frames:
                 print(f"Truncating video from {num_real_frames} to {num_frames} frames for latent size compatibility")
             num_real_frames = num_frames
+
+            if num_frames == 0:
+                print("Warning: Video has 0 processable frames after truncation.")
+                # Determine expected shapes for return values
+                native_height, native_width = vr.height, vr.width
+
+                if not no_resize:
+                    target_h, target_w = find_nearest_bucket(native_height, native_width, resolution=resolution)
+                else:
+                    target_h, target_w = native_height, native_width
+
+                dummy_latent_h, dummy_latent_w = target_h // 8, target_w // 8
+
+                # Create empty/zero tensors with expected shapes and dtypes
+                empty_start_latent = torch.zeros((1, 16, 1, dummy_latent_h, dummy_latent_w), dtype=torch.float32, device=self.cpu)
+                empty_history_latents = torch.zeros((1, 16, 0, dummy_latent_h, dummy_latent_w), dtype=torch.float32, device=self.cpu) # 0 frames
+                empty_input_image_np = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                empty_input_video_pixels = torch.zeros((1, 3, 0, target_h, target_w), dtype=torch.float32, device=self.cpu)
+
+                return empty_start_latent, empty_input_image_np, empty_history_latents, fps, target_h, target_w, empty_input_video_pixels
 
             # Read frames
             print("Reading video frames...")
