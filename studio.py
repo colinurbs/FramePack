@@ -1356,5 +1356,6 @@ interface.launch(
     server_name=args.server,
     server_port=args.port,
     share=args.share,
-    inbrowser=args.inbrowser
+    inbrowser=args.inbrowser,
+    allowed_paths=[settings.get("output_dir"), settings.get("metadata_dir")],
 )
