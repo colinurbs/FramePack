@@ -79,7 +79,9 @@ _initialize_presets() # Call once when the script module is loaded
 def tb_update_messages():
     return tb_message_mgr.get_messages()
 
-def tb_handle_update_monitor(): # This updates the TOOLBOX TAB's monitor
+def tb_handle_update_monitor(monitor_enabled): # This updates the TOOLBOX TAB's monitor
+    if not monitor_enabled:
+        return gr.update() # Do nothing if disabled to save resources.
     return SystemMonitor.get_system_info()
 
 def tb_handle_analyze_video(video_path):
@@ -646,98 +648,29 @@ def tb_create_video_toolbox_ui():
                         value=initial_autosave_state,
                         scale=1
                     )
+    with gr.Accordion("💡 Video Analysis and System Monitor", open=True):
         with gr.Row():
             with gr.Column(scale=1):
                 tb_video_analysis_output = gr.Textbox(
-                    label="Video Analysis",
+                    # label="Video Analysis",
+                    container=False,
                     lines=12,
+                    show_label=False,
                     interactive=False,
                     elem_classes="analysis-box",
                 )
-            with gr.Column(scale=1):
-                tb_resource_monitor_output = gr.Textbox(
-                    label="💻 System Monitor",
-                    lines=9,
-                    interactive=False,
-                )
+            with gr.Column(scale=1): 
+                with gr.Row(scale=4):                
+                    tb_monitor_toggle_checkbox = gr.Checkbox(label="Live System Monitoring", scale=1, value=False)
+                    tb_delete_studio_transformer_btn = gr.Button("📤 Unload Studio Model", scale=3, variant="stop")
                 with gr.Row():
-                    tb_delete_studio_transformer_btn = gr.Button(
-                        "📤 Unload Studio Model", variant="stop")
-                    gr.Markdown(
-                        "Unload main model to free VRAM. Studio reloads it on next gen."
+                    tb_resource_monitor_output = gr.Textbox(
+                        show_label=False,
+                        container=False,
+                        lines=9,
+                        interactive=False,
+                        visible=False, # Initially hidden
                     )
-
-        # NEW: Toolbox Guide & Tips Accordion
-        with gr.Accordion("💡 Post-processing Guide & Tips", open=False): # Initially closed, title updated
-            gr.Markdown(value="""### This set of tools is designed to help you post-process your generated videos.
-
-
-**Core Workflow:**
-*   **Input & Output:** Most operations use the video in the **'Upload Video' ⬅️ (top-left)** player as their input.
-*   Processed videos will appear in the **'Processed Video' ➡️ (top-right)** player.
-*   **Analysis First:** It's often helpful to upload a video and click **'📊 Analyze Video'** first. This provides details like resolution, frame rate, and duration, which can inform your choices for processing.
-
-
-**Chaining Operations (Applying Multiple Effects):**
-*   To apply several effects one after another (e.g., first upscale, then change speed, then apply filters, etc):
-    1.  Perform the first operation (e.g., apply upscale).
-    2.  Once the processed video appears, click the **'🔄 Use Processed as Input'** button. This moves the result from the 'Processed Video' player to the 'Upload Video' player.
-    3.  Now, the output of the first operation is ready to be the input for your next operation.
-    4.  Repeat as needed.
-
-
-**Saving Your Work:**
-*   By default, all processed videos are auto-saved to the 'saved_videos' folder.
-
-*   **To save outputs manually:**
-    *   Disable the **'Autosave' checkbox**. When unchecked, all processed videos will save to the 'temp_processing' folder.
-    *   Use the **'💾 Save to Permanent Folder'** button (visible if Autosave is off). This saves the current video from the 'Processed Video' player to the 'saved_videos' folder.
-
-*   You can open the permanent output folder using the **'📁 Open Output Folder'** button.
-*   You can empty the 'temp_processing' folder by pressing the **`🗑️ Clear Temporary Files`** button
-
-
-**Working with Video Filters & Presets:**
-*   Adjust visual effects like brightness, contrast, and color using the **Filter Sliders**.
-*   **Load Preset Dropdown:** Select a pre-defined or saved custom look.
-*   **Preset Name Textbox:**
-    *   Shows the loaded preset's name.
-    *   Type a new name here to save current slider settings as a new preset.
-*   **💾 Save/Update Button:** Saves the current slider settings using the name in the 'Preset Name' textbox. Adds new presets to the dropdown or updates existing ones.
-*   **🗑️ Delete Button:** Deletes the preset whose name is currently in the 'Preset Name' textbox from your saved presets.
-*   **🔄 Reset All Sliders Button:** Clears all filter effects, sets sliders to default ("none" preset values).
-*   **✨ Apply Filters to Video Button:** Processes the input video with the current filter slider settings.
-
-
-**Understanding Frames I/O:**
-*   **Extracting:** You can extract frames from the input video. These are saved into a new subfolder within `postprocessed_output/toolbox_frames/extracted_frames/`.
-        **This defaults to extracting _every_ frame. If you're after fewer frames, change the '1' to a higher number - i.e. `5` will extract every 5th frame (~30 frames from a typical 5s FramePack video)**
-*   **Reassembling:**
-    *   **Dropdown:** You can select one of these previously extracted folders from the **'Select Previously Extracted Folder'** dropdown menu.
-    *   **Upload:** Alternatively, you can upload your own folder of frames or individual frame images using the **'Upload Frame Images Folder'** component.
-    *   **Precedence:** If a folder is selected in the dropdown, any files/folder provided to the 'Upload Frame Images Folder' component will be **ignored**. The dropdown selection takes priority.
-    *   **Refresh:** Use '🔄 Refresh List' on first use to populate the dropdown and/or after an extraction or if you've manually added/removed folders in the `extracted_frames` directory.
-
-
-**Unloading the Main Studio Model:**
-*   The **'📤 Unload Studio Model'** button attempts to remove the main video generation model from your computer's memory (VRAM).
-*   **Why use this?**
-    *   To free up VRAM if you plan to run memory-heavy tasks in this toolbox (like '📈 Upscale Video') and are not actively using the main video generation tab.
-
-*   The main Studio interface will automatically reload this model when you start a new generation task there.
-
-
-**Important Dependency: FFmpeg**
-*   Audio functions in this toolbox and reliable video analysis depend on **FFmpeg**.
-*   The application will use a "lite" version of FFmpeg bundled with `imageio-ffmpeg`.
-*   **For best results and full functionality (especially audio handling):** It's highly recommended to have a full, up-to-date version of FFmpeg (with `ffprobe`) installed on your system and accessible in your system's PATH.
-*   If FFmpeg or ffprobe is not found or not fully functional, audio handling operations might be limited and produce silent video. Check the 'Console Messages' for status.
-*   Adding ffprobe and/or full ffmpeg is likely in a future update!
-
-
-**Check Console Messages:**
-*   The **'Console Messages' box** at the bottom of the tab provides important feedback, status updates, warnings, and error messages for all operations. Always check it if something doesn't seem right!
-            """)
 
     with gr.Accordion("Operations", open=True):
         with gr.Tabs():
@@ -926,6 +859,78 @@ def tb_create_video_toolbox_ui():
                         )
                         tb_reassemble_frames_btn = gr.Button("🧩 Reassemble Video", variant="primary")
 
+        # NEW: Toolbox Guide & Tips Accordion
+        with gr.Accordion("💡 Post-processing Guide & Tips", open=False): # Initially closed, title updated
+            gr.Markdown(value="""### This set of tools is designed to help you post-process your generated videos.
+
+
+**Core Workflow:**
+*   **Input & Output:** Most operations use the video in the **'Upload Video' ⬅️ (top-left)** player as their input.
+*   Processed videos will appear in the **'Processed Video' ➡️ (top-right)** player.
+*   **Analysis First:** It's often helpful to upload a video and click **'📊 Analyze Video'** first. This provides details like resolution, frame rate, and duration, which can inform your choices for processing.
+
+
+**Chaining Operations (Applying Multiple Effects):**
+*   To apply several effects one after another (e.g., first upscale, then change speed, then apply filters, etc):
+    1.  Perform the first operation (e.g., apply upscale).
+    2.  Once the processed video appears, click the **'🔄 Use Processed as Input'** button. This moves the result from the 'Processed Video' player to the 'Upload Video' player.
+    3.  Now, the output of the first operation is ready to be the input for your next operation.
+    4.  Repeat as needed.
+
+
+**Saving Your Work:**
+*   By default, all processed videos are auto-saved to the 'saved_videos' folder.
+
+*   **To save outputs manually:**
+    *   Disable the **'Autosave' checkbox**. When unchecked, all processed videos will save to the 'temp_processing' folder.
+    *   Use the **'💾 Save to Permanent Folder'** button (visible if Autosave is off). This saves the current video from the 'Processed Video' player to the 'saved_videos' folder.
+
+*   You can open the permanent output folder using the **'📁 Open Output Folder'** button.
+*   You can empty the 'temp_processing' folder by pressing the **`🗑️ Clear Temporary Files`** button
+
+
+**Working with Video Filters & Presets:**
+*   Adjust visual effects like brightness, contrast, and color using the **Filter Sliders**.
+*   **Load Preset Dropdown:** Select a pre-defined or saved custom look.
+*   **Preset Name Textbox:**
+    *   Shows the loaded preset's name.
+    *   Type a new name here to save current slider settings as a new preset.
+*   **💾 Save/Update Button:** Saves the current slider settings using the name in the 'Preset Name' textbox. Adds new presets to the dropdown or updates existing ones.
+*   **🗑️ Delete Button:** Deletes the preset whose name is currently in the 'Preset Name' textbox from your saved presets.
+*   **🔄 Reset All Sliders Button:** Clears all filter effects, sets sliders to default ("none" preset values).
+*   **✨ Apply Filters to Video Button:** Processes the input video with the current filter slider settings.
+
+
+**Understanding Frames I/O:**
+*   **Extracting:** You can extract frames from the input video. These are saved into a new subfolder within `postprocessed_output/toolbox_frames/extracted_frames/`.
+        **This defaults to extracting _every_ frame. If you're after fewer frames, change the '1' to a higher number - i.e. `5` will extract every 5th frame (~30 frames from a typical 5s FramePack video)**
+*   **Reassembling:**
+    *   **Dropdown:** You can select one of these previously extracted folders from the **'Select Previously Extracted Folder'** dropdown menu.
+    *   **Upload:** Alternatively, you can upload your own folder of frames or individual frame images using the **'Upload Frame Images Folder'** component.
+    *   **Precedence:** If a folder is selected in the dropdown, any files/folder provided to the 'Upload Frame Images Folder' component will be **ignored**. The dropdown selection takes priority.
+    *   **Refresh:** Use '🔄 Refresh List' on first use to populate the dropdown and/or after an extraction or if you've manually added/removed folders in the `extracted_frames` directory.
+
+
+**Unloading the Main Studio Model:**
+*   The **'📤 Unload Studio Model'** button attempts to remove the main video generation model from your computer's memory (VRAM).
+*   **Why use this?**
+    *   To free up VRAM if you plan to run memory-heavy tasks in this toolbox (like '📈 Upscale Video') and are not actively using the main video generation tab.
+
+*   The main Studio interface will automatically reload this model when you start a new generation task there.
+
+
+**Important Dependency: FFmpeg**
+*   Audio functions in this toolbox and reliable video analysis depend on **FFmpeg**.
+*   The application will use a "lite" version of FFmpeg bundled with `imageio-ffmpeg`.
+*   **For best results and full functionality (especially audio handling):** It's highly recommended to have a full, up-to-date version of FFmpeg (with `ffprobe`) installed on your system and accessible in your system's PATH.
+*   If FFmpeg or ffprobe is not found or not fully functional, audio handling operations might be limited and produce silent video. Check the 'Console Messages' for status.
+*   Adding ffprobe and/or full ffmpeg is likely in a future update!
+
+
+**Check Console Messages:**
+*   The **'Console Messages' box** at the bottom of the tab provides important feedback, status updates, warnings, and error messages for all operations. Always check it if something doesn't seem right!
+            """)
+
         with gr.Row():
             tb_message_output = gr.Textbox(label="Console Messages", lines=10, interactive=False, elem_classes="message-box", value=tb_update_messages)
         with gr.Row():
@@ -1091,10 +1096,17 @@ def tb_create_video_toolbox_ui():
             outputs=[tb_message_output]
         )
 
-        tb_monitor_timer = gr.Timer(2, active=True)
+        # This will show/hide the monitor output textbox.
+        tb_monitor_toggle_checkbox.change(
+            fn=lambda is_enabled: gr.update(visible=is_enabled),
+            inputs=[tb_monitor_toggle_checkbox],
+            outputs=[tb_resource_monitor_output]
+        )
 
+        tb_monitor_timer = gr.Timer(2, active=True)
         tb_monitor_timer.tick(
             fn=tb_handle_update_monitor,
+            inputs=[tb_monitor_toggle_checkbox], # Pass the checkbox state to the handler
             outputs=[tb_resource_monitor_output],
         )
         # ADDED: Event handler for the new unload button
