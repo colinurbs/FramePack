@@ -1545,7 +1545,8 @@ def create_interface(
              end_frame_strength_original_arg,
              prompt_text_arg,
              n_prompt_arg,
-             seed_arg,
+             seed_arg, # the seed value
+             randomize_seed_arg, # the boolean value of the checkbox
              total_second_length_arg,
              latent_window_size_arg,
              steps_arg,
@@ -1607,7 +1608,7 @@ def create_interface(
                                )
             # If randomize_seed is checked, generate a new random seed for the next job
             new_seed_value = None
-            if randomize_seed.value:
+            if randomize_seed_arg:
                 new_seed_value = random.randint(0, 21474)
                 print(f"Generated new seed for next job: {new_seed_value}")
 
@@ -1684,6 +1685,7 @@ def create_interface(
             prompt,                     # Corresponds to prompt_text_arg
             n_prompt,                   # Corresponds to n_prompt_arg
             seed,                       # Corresponds to seed_arg
+            randomize_seed,             # Corresponds to randomize_seed_arg
             total_second_length,        # Corresponds to total_second_length_arg
             latent_window_size,         # Corresponds to latent_window_size_arg
             steps,                      # Corresponds to steps_arg
