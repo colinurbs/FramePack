@@ -337,11 +337,11 @@ def worker(
                 input_files_dir=job_params['input_files_dir']
             )
 
+            # RT_BORG: retained only until we make our final decisions on how to handle combining videos
             # Only necessary to retain resized frames to produce a combined video with source frames of the right dimensions 
-            if combine_with_source:
-                # Store input_frames_resized_np in job_params for later use
-                job_params['input_frames_resized_np'] = input_frames_resized_np
-
+            #if combine_with_source:
+            #    # Store input_frames_resized_np in job_params for later use
+            #    job_params['input_frames_resized_np'] = input_frames_resized_np
             
             # CLIP Vision encoding for the first frame
             stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
@@ -999,16 +999,27 @@ def worker(
                 print(f"Error combining videos: {e_combine_outer}")
                 traceback.print_exc()
     
-        # Combine processed input frames (from video_encode) with final generated history_pixels tensor sequentially ---
+        # Combine input frames (resized and center cropped if needed) with final generated history_pixels tensor sequentially ---
         # This creates _combined2.mp4
-        if (model_type == "Video" or model_type == "Video F1") and combine_with_source and job_params.get('input_frames_resized_np') is not None and history_pixels is not None:
+        # RT_BORG: Be sure to add this check if we decide to retain the processed input frames for "small" input videos 
+        # and job_params.get('input_frames_resized_np') is not None 
+        if (model_type == "Video" or model_type == "Video F1") and combine_with_source and history_pixels is not None:
             print("Creating sequentially combined video (_combined2.mp4) with processed input frames and generated history_pixels tensor...")
             try:
-                processed_input_frames_for_combine = job_params.get('input_frames_resized_np')
-                
+                # input_frames_resized_np = job_params.get('input_frames_resized_np')
+
+                # RT_BORG: I cringe calliing methods on BaseModelGenerator that only exist on VideoBaseGenerator, until we refactor
+                input_frames_resized_np, fps, target_height, target_width = studio_module.current_generator.extract_video_frames(
+                    is_for_encode=False,
+                    video_path=job_params['input_image'],
+                    resolution=job_params['resolutionW'],
+                    no_resize=False,
+                    input_files_dir=job_params['input_files_dir']
+                )
+
                 # history_pixels is (B, C, T, H, W), float32, [-1,1], on CPU
 
-                if processed_input_frames_for_combine is not None and history_pixels.numel() > 0 : # Check if history_pixels is not empty
+                if input_frames_resized_np is not None and history_pixels.numel() > 0 : # Check if history_pixels is not empty
                     combined_sequential_output_filename = os.path.join(output_dir, f'{job_id}_combined2.mp4')
                     
                     # fps variable should be from the video_encode call earlier.
@@ -1017,7 +1028,7 @@ def worker(
 
                     # Call the new function from video_tools.py
                     combined_sequential_result_path = combine_videos_sequentially_from_tensors(
-                        processed_input_frames_np=processed_input_frames_for_combine,
+                        processed_input_frames_np=input_frames_resized_np,
                         generated_frames_pt=history_pixels,
                         output_path=combined_sequential_output_filename,
                         target_fps=input_video_fps_for_combine,

@@ -83,44 +83,69 @@ class VideoBaseModelGenerator(BaseModelGenerator):
         print(f"{self.model_name} Transformer Loaded from {path_to_load}.")
         return self.transformer
     
-    # RT_BORG: video_encode produce and return end_of_input_video_latent and end_of_input_video_image_np
-    # which are not needed for Video models wihtout end frame processing.
-    # But these should be inexpensive and it's easier to keep the code uniform.
-    @torch.no_grad()
-    def video_encode(self, video_path, resolution, no_resize=False, vae_batch_size=16, device=None, input_files_dir=None):
+    def min_real_frames_to_encode(self, real_frames_available_count):
         """
-        Encode a video into latent representations using the VAE.
+        Minimum number of real frames to encode
+        is the maximum number of real frames used for generation context.
+        
+        The number of latents could be calculated as below, but keeping it simple for now
+        by hardcoding the value at max_latents_used_for_context = 27.
+
+        # Calculate the number of latent frames to encode from the end of the input video
+        num_frames_to_encode_from_end = 1  # Default minimum
+        if model_type == "Video":
+            # Max needed is 1 (clean_latent_pre) + 2 (max 2x) + 16 (max 4x) = 19
+            num_frames_to_encode_from_end = 19
+        elif model_type == "Video F1":
+            ui_num_cleaned_frames = job_params.get('num_cleaned_frames', 5)
+            # Max effective_clean_frames based on VideoF1ModelGenerator's logic.
+            # Max num_clean_frames from UI is 10 (modules/interface.py).
+            # Max effective_clean_frames = 10 - 1 = 9.
+            # total_context_frames = num_4x_frames + num_2x_frames + effective_clean_frames
+            # Max needed = 16 (max 4x) + 2 (max 2x) + 9 (max effective_clean_frames) = 27
+            num_frames_to_encode_from_end = 27
+        """
+        max_latents_used_for_context = 27  # Enough for even Video F1 with cleaned_frames input of 10
+        latent_size_factor = 4 # real frames to latent frames conversion factor
+
+        max_real_frames_used_for_context = max_latents_used_for_context * latent_size_factor
+
+        # Shortest of available frames and max frames used for context
+        trimmed_real_frames_count = min(real_frames_available_count, max_real_frames_used_for_context)
+        if trimmed_real_frames_count != real_frames_available_count:
+            print(f"Truncating video from {real_frames_available_count} to {trimmed_real_frames_count}, enough to populate context")
+
+        # Truncate to nearest latent size (multiple of 4)
+        frames_to_encode_count = (trimmed_real_frames_count // latent_size_factor) * latent_size_factor
+        if frames_to_encode_count != trimmed_real_frames_count:
+            print(f"Truncating video from {trimmed_real_frames_count} to {frames_to_encode_count} frames for latent size compatibility")
+
+        return frames_to_encode_count
+
+    def extract_video_frames(self, is_for_encode, video_path, resolution, no_resize=False, input_files_dir=None):
+        """
+        Extract real frames from a video, resized and center cropped as numpy array (T, H, W, C).
         
         Args:
+            is_for_encode: If True, results are capped at maximum frames used for context, and aligned to 4-frame latent requirement.
             video_path: Path to the input video file.
             resolution: Target resolution for resizing frames.
             no_resize: Whether to use the original video resolution.
-            vae_batch_size: Number of frames to process per batch.
-            device: Device for computation (e.g., "cuda").
             input_files_dir: Directory for input files that won't be cleaned up.
         
         Returns:
             A tuple containing:
-            - start_latent: Latent of the first frame
-            - input_image_np: First frame as numpy array
-            - history_latents: Latents of all frames
+            - input_frames_resized_np: All input frames resized and center cropped as numpy array (T, H, W, C)
             - fps: Frames per second of the input video
             - target_height: Target height of the video
             - target_width: Target width of the video
-            - input_video_pixels: Video frames as tensor
-            - end_of_input_video_image_np: Last frame as numpy array
-            - input_frames_resized_np: All input frames resized and center cropped as numpy array (T, H, W, C)
         """
         def time_millis():
             import time
-            # Use time.perf_counter() for accurate interval measurement
             return time.perf_counter() * 1000.0 # Convert seconds to milliseconds
         
         encode_start_time_millis = time_millis()
-
-        if device is None:
-            device = self.gpu
-            
+           
         # Normalize video path for Windows compatibility
         video_path = str(pathlib.Path(video_path).resolve())
         print(f"Processing video: {video_path}")
@@ -148,11 +173,6 @@ class VideoBaseModelGenerator(BaseModelGenerator):
                 except Exception as e:
                     print(f"Error copying video to input_files_dir: {e}")
 
-        # Check CUDA availability and fallback to CPU if needed
-        if device == "cuda" and not torch.cuda.is_available():
-            print("CUDA is not available, falling back to CPU")
-            device = "cpu"
-
         try:
             # Load video and get FPS
             print("Initializing VideoReader...")
@@ -161,23 +181,30 @@ class VideoBaseModelGenerator(BaseModelGenerator):
             num_real_frames = len(vr)
             print(f"Video loaded: {num_real_frames} frames, FPS: {fps}")
 
-            # Truncate to nearest latent size (multiple of 4)
-            latent_size_factor = 4
-            num_frames = (num_real_frames // latent_size_factor) * latent_size_factor
-            if num_frames != num_real_frames:
-                print(f"Truncating video from {num_real_frames} to {num_frames} frames for latent size compatibility")
-            num_real_frames = num_frames
-
             # Read frames
             print("Reading video frames...")
+
+            total_frames_in_video_file = len(vr)
+            if is_for_encode:
+                print(f"Using minimum real frames to encode: {self.min_real_frames_to_encode(total_frames_in_video_file)}")
+                num_real_frames = self.min_real_frames_to_encode(total_frames_in_video_file)
+            # else left as all frames -- len(vr) with no regard for trimming or latent alignment
 
             # RT_BORG: Retaining this commented code for reference.
             # pftq encoder discarded truncated frames from the end of the video.
             # frames = vr.get_batch(range(num_real_frames)).asnumpy()  # Shape: (num_real_frames, height, width, channels)
 
+            # RT_BORG: Retaining this commented code for reference.
+            # pftq retained the entire encoded video.
+            # Truncate to nearest latent size (multiple of 4)
+            # latent_size_factor = 4
+            # num_frames = (num_real_frames // latent_size_factor) * latent_size_factor
+            # if num_frames != num_real_frames:
+            #     print(f"Truncating video from {num_real_frames} to {num_frames} frames for latent size compatibility")
+            # num_real_frames = num_frames
+
             # Discard truncated frames from the beginning of the video, retaining the last num_real_frames
             # This ensures a smooth transition from the input video to the generated video
-            total_frames_in_video_file = len(vr)
             start_frame_index = total_frames_in_video_file - num_real_frames
             frame_indices_to_extract = range(start_frame_index, total_frames_in_video_file)
             frames = vr.get_batch(frame_indices_to_extract).asnumpy()  # Shape: (num_real_frames, height, width, channels)
@@ -201,7 +228,7 @@ class VideoBaseModelGenerator(BaseModelGenerator):
 
             # Preprocess input frames to match desired resolution
             input_frames_resized_np = []
-            for i, frame in enumerate(frames):
+            for i, frame in tqdm(enumerate(frames), desc="Processing Video Frames", total=num_real_frames, mininterval=0.1):
                 frame_np = resize_and_center_crop(frame, target_width=target_width, target_height=target_height)
                 input_frames_resized_np.append(frame_np)
             input_frames_resized_np = np.stack(input_frames_resized_np)  # Shape: (num_real_frames, height, width, channels)
@@ -216,8 +243,53 @@ class VideoBaseModelGenerator(BaseModelGenerator):
             print(f"    *****    input_frames_resized_np: {input_frames_resized_np.shape}")
             print(f"    *****    Memory usage: {int(memory_mb)} MB")
             duration_ms = resized_frames_time_millis - encode_start_time_millis
-            print(f"    *****    Time taken to encode and resize frames: {duration_ms / 1000.0:.2f} seconds")
+            print(f"    *****    Time taken to process frames tensor: {duration_ms / 1000.0:.2f} seconds")
             print("======================================================")
+
+            return input_frames_resized_np, fps, target_height, target_width
+        except Exception as e:
+            print(f"Error in extract_video_frames: {str(e)}")
+            raise
+
+    # RT_BORG: video_encode produce and return end_of_input_video_latent and end_of_input_video_image_np
+    # which are not needed for Video models without end frame processing.
+    # But these should be inexpensive and it's easier to keep the code uniform.
+    @torch.no_grad()
+    def video_encode(self, video_path, resolution, no_resize=False, vae_batch_size=16, device=None, input_files_dir=None):
+        """
+        Encode a video into latent representations using the VAE.
+        
+        Args:
+            video_path: Path to the input video file.
+            resolution: Target resolution for resizing frames.
+            no_resize: Whether to use the original video resolution.
+            vae_batch_size: Number of frames to process per batch.
+            device: Device for computation (e.g., "cuda").
+            input_files_dir: Directory for input files that won't be cleaned up.
+        
+        Returns:
+            A tuple containing:
+            - start_latent: Latent of the first frame
+            - input_image_np: First frame as numpy array
+            - history_latents: Latents of all frames
+            - fps: Frames per second of the input video
+            - target_height: Target height of the video
+            - target_width: Target width of the video
+            - input_video_pixels: Video frames as tensor
+            - end_of_input_video_image_np: Last frame as numpy array
+            - input_frames_resized_np: All input frames resized and center cropped as numpy array (T, H, W, C)
+        """
+        encoding = True  # Flag to indicate this is for encoding
+        input_frames_resized_np, fps, target_height, target_width = self.extract_video_frames(encoding, video_path, resolution, no_resize, input_files_dir)
+
+        try:
+            if device is None:
+                device = self.gpu
+                
+            # Check CUDA availability and fallback to CPU if needed
+            if device == "cuda" and not torch.cuda.is_available():
+                print("CUDA is not available, falling back to CPU")
+                device = "cpu"
 
             # Save first frame for CLIP vision encoding
             input_image_np = input_frames_resized_np[0]
@@ -249,7 +321,9 @@ class VideoBaseModelGenerator(BaseModelGenerator):
             latents = []
             self.vae.eval()
             with torch.no_grad():
-                for i in tqdm(range(0, frames_pt.shape[2], vae_batch_size), desc="Encoding video frames", mininterval=0.1):
+                frame_count = frames_pt.shape[2]
+                step_count = math.ceil(frame_count / vae_batch_size)
+                for i in tqdm(range(0, frame_count, vae_batch_size), desc="Encoding video frames", total=step_count, mininterval=0.1):
                     batch = frames_pt[:, :, i:i + vae_batch_size]  # Shape: (1, channels, batch_size, height, width)
                     try:
                         # Log GPU memory before encoding
@@ -283,7 +357,6 @@ class VideoBaseModelGenerator(BaseModelGenerator):
             print(f"    *****    history_latents: {history_latents.shape}")
             print(f"    *****    Memory usage: {int(memory_mb)} MB")
             print("======================================================")
-
 
             # Move VAE back to CPU to free GPU memory
             if device == "cuda":
