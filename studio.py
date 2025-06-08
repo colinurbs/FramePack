@@ -210,6 +210,9 @@ if os.path.isdir(lora_folder_from_settings):
                     lora_name = str(PurePath(lora_relative_path).with_suffix(''))
                     lora_names.append(lora_name)
         print(f"Found LoRAs: {lora_names}")
+        # Temp solution for only 1 lora
+        if len(lora_names) == 1 :
+            lora_names.append("dummy lora - DO NOT USE - will disappear with multiple loras")        
     except Exception as e:
         print(f"Error scanning LoRA directory '{lora_folder_from_settings}': {e}")
 else:
