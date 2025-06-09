@@ -336,6 +336,7 @@ def worker(
                 n_prompt_str, text_encoder, text_encoder_2, tokenizer, tokenizer_2, gpu, prompt_embedding_cache
             )
 
+        end_of_input_video_embedding = None # Video model end frame CLIP Vision embedding
         # Process input image or video based on model type
         if model_type == "Video" or model_type == "Video F1":
             stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Video processing ...'))))
@@ -422,7 +423,6 @@ def worker(
         # VAE encode end_frame_image resized to output dimensions, if provided
         end_frame_output_dimensions_latent = None 
         end_clip_embedding = None # Video model end frame CLIP Vision embedding
-        end_of_input_video_embedding = None # Video model end frame CLIP Vision embedding
 
         # Models with end_frame_image processing
         if (model_type == "Original with Endframe" or model_type == "Video") and job_params.get('end_frame_image') is not None:
