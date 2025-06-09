@@ -926,7 +926,9 @@ def worker(
 
         # Check if the user wants to combine the source video with the generated video
         # This is done after the video cleanup routine to ensure the combined video is not deleted
-        if (model_type == "Video" or model_type == "Video F1") and combine_with_source and job_params.get('input_image_path'):
+        # RT_BORG: Retain (but suppress) this original way to combine videos until the new combiner is proven.
+        combine_v1 = False
+        if combine_v1 and (model_type == "Video" or model_type == "Video F1") and combine_with_source and job_params.get('input_image_path'):
             print("Creating combined video with source and generated content...")
             try:
                 input_video_path = job_params.get('input_image_path')
@@ -949,7 +951,7 @@ def worker(
                              final_video_path_for_combine = os.path.join(output_dir, video_files_sorted_for_combine[-1])
                     
                     if final_video_path_for_combine and os.path.exists(final_video_path_for_combine):
-                        combined_output_filename = os.path.join(output_dir, f'{job_id}_combined.mp4')
+                        combined_output_filename = os.path.join(output_dir, f'{job_id}_combined_v1.mp4')
                         combined_result = None
                         try:
                             if hasattr(studio_module.current_generator, 'combine_videos'):
@@ -1013,11 +1015,11 @@ def worker(
                 traceback.print_exc()
     
         # Combine input frames (resized and center cropped if needed) with final generated history_pixels tensor sequentially ---
-        # This creates _combined2.mp4
+        # This creates ID_combined.mp4
         # RT_BORG: Be sure to add this check if we decide to retain the processed input frames for "small" input videos 
         # and job_params.get('input_frames_resized_np') is not None 
         if (model_type == "Video" or model_type == "Video F1") and combine_with_source and history_pixels is not None:
-            print("Creating sequentially combined video (_combined2.mp4) with processed input frames and generated history_pixels tensor...")
+            print(f"Creating combined video ({job_id}_combined.mp4) with processed input frames and generated history_pixels tensor...")
             try:
                 # input_frames_resized_np = job_params.get('input_frames_resized_np')
 
@@ -1031,9 +1033,8 @@ def worker(
                 )
 
                 # history_pixels is (B, C, T, H, W), float32, [-1,1], on CPU
-
                 if input_frames_resized_np is not None and history_pixels.numel() > 0 : # Check if history_pixels is not empty
-                    combined_sequential_output_filename = os.path.join(output_dir, f'{job_id}_combined2.mp4')
+                    combined_sequential_output_filename = os.path.join(output_dir, f'{job_id}_combined.mp4')
                     
                     # fps variable should be from the video_encode call earlier.
                     input_video_fps_for_combine = fps 
@@ -1050,7 +1051,7 @@ def worker(
                     if combined_sequential_result_path:
                         stream_to_use.output_queue.push(('file', combined_sequential_result_path))
             except Exception as e:
-                print(f"Error creating sequentially combined video (_combined2.mp4): {e}")
+                print(f"Error creating combined video ({job_id}_combined.mp4): {e}")
                 traceback.print_exc()
     
     # Final verification of LoRA state
