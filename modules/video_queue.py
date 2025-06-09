@@ -481,40 +481,55 @@ class VideoJobQueue:
         except Exception as e:
             print(f"Error saving queue to JSON: {e}")
     
-    def cleanup_orphaned_videos(self, current_job_ids):
+    def cleanup_orphaned_videos(self, current_job_ids_uuids): # Renamed arg for clarity
         """
-        Remove video files for jobs that no longer exist in the queue.
+        Remove video files from input_files_dir for jobs that no longer exist
+        or whose input_image_path does not point to them.
         
         Args:
-            current_job_ids: List of job IDs currently in the queue
+            current_job_ids_uuids: List of job UUIDs currently in self.jobs
         """
         try:
-            input_files_dir = "input_files"
+            # Get the input_files_dir from settings to be robust
+            settings = Settings()
+            input_files_dir = settings.get("input_files_dir", "input_files")
             if not os.path.exists(input_files_dir):
                 return
-            
-            # Convert to set for faster lookups
-            current_job_ids = set(current_job_ids)
-            
-            # Check all files in the input_files directory
+
+            referenced_video_paths = set()
+            with self.lock: # Access self.jobs safely
+                for job_id_uuid in current_job_ids_uuids: # Iterate using the provided UUIDs
+                    job = self.jobs.get(job_id_uuid)
+                    if job and job.params:
+                        # For Video models, job.params['input_image'] is the path after studio.py copy.
+                        # This is the path that decord will try to open.
+                        video_path_from_job_params = job.params.get('input_image')
+                        if isinstance(video_path_from_job_params, str) and os.path.isabs(video_path_from_job_params) and input_files_dir in os.path.normpath(video_path_from_job_params):
+                            referenced_video_paths.add(os.path.normpath(video_path_from_job_params))
+                        
+                        # Also consider 'input_image_path' which might be used by other logic or older jobs.
+                        input_image_path_val = job.params.get('input_image_path')
+                        if isinstance(input_image_path_val, str) and os.path.isabs(input_image_path_val) and input_files_dir in os.path.normpath(input_image_path_val):
+                             referenced_video_paths.add(os.path.normpath(input_image_path_val))
+
             removed_count = 0
             for filename in os.listdir(input_files_dir):
-                # Only process video files
-                if filename.endswith(".mp4"):
-                    # If the filename is not in the current job ids, remove the file
-                    if filename.split("_")[0] not in current_job_ids:
-                        file_path = os.path.join(input_files_dir, filename)
+                if filename.endswith(".mp4"): # Only process MP4 files
+                    file_path_to_check = os.path.normpath(os.path.join(input_files_dir, filename))
+                    
+                    if file_path_to_check not in referenced_video_paths:
                         try:
-                            os.remove(file_path)
+                            os.remove(file_path_to_check)
                             removed_count += 1
-                            print(f"Removed orphaned video: {filename}")
+                            print(f"Removed orphaned video: {filename} (path: {file_path_to_check})")
                         except Exception as e:
                             print(f"Error removing orphaned video {filename}: {e}")
-            
             if removed_count > 0:
-                print(f"Cleaned up {removed_count} orphaned videos")
+                print(f"Cleaned up {removed_count} orphaned videos from {input_files_dir}")
         except Exception as e:
             print(f"Error cleaning up orphaned videos: {e}")
+            import traceback
+            traceback.print_exc()
 
     def cleanup_orphaned_images(self, current_job_ids):
         """
