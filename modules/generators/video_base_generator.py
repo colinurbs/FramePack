@@ -88,8 +88,8 @@ class VideoBaseModelGenerator(BaseModelGenerator):
         Minimum number of real frames to encode
         is the maximum number of real frames used for generation context.
         
-        The number of latents could be calculated as below, but keeping it simple for now
-        by hardcoding the value at max_latents_used_for_context = 27.
+        The number of latents could be calculated as below for video F1, but keeping it simple for now
+        by hardcoding the Video F1 value at max_latents_used_for_context = 27.
 
         # Calculate the number of latent frames to encode from the end of the input video
         num_frames_to_encode_from_end = 1  # Default minimum
@@ -104,21 +104,38 @@ class VideoBaseModelGenerator(BaseModelGenerator):
             # total_context_frames = num_4x_frames + num_2x_frames + effective_clean_frames
             # Max needed = 16 (max 4x) + 2 (max 2x) + 9 (max effective_clean_frames) = 27
             num_frames_to_encode_from_end = 27
+        
+        Note: 27 latents ~ 108 real frames = 3.6 seconds at 30 FPS.
+        Note: 19 latents ~ 76 real frames ~ 2.5 seconds at 30 FPS.
         """
-        max_latents_used_for_context = 27  # Enough for even Video F1 with cleaned_frames input of 10
-        latent_size_factor = 4 # real frames to latent frames conversion factor
 
+        max_latents_used_for_context = 27
+        if self.get_model_name == "Video":
+            max_latents_used_for_context = 19
+        elif self.get_model_name == "Video F1":
+            max_latents_used_for_context = 27  # Enough for even Video F1 with cleaned_frames input of 10
+        else:
+            print("======================================================")
+            print(f"    *****    Warning: Unsupported video extension model type: {self.get_model_name()}.")
+            print( "    *****    Using default max latents {max_latents_used_for_context} for context.")
+            print( "    *****    Please report to the developers if you see this message:")
+            print( "    *****    Discord: https://discord.gg/8Z2c3a4 or GitHub: https://github.com/colinurbs/FramePack-Studio")
+            print("======================================================")
+            # Probably better to press on with Video F1 max vs exception?
+            # raise ValueError(f"Unsupported video extension model type: {self.get_model_name()}")
+
+        latent_size_factor = 4 # real frames to latent frames conversion factor
         max_real_frames_used_for_context = max_latents_used_for_context * latent_size_factor
 
         # Shortest of available frames and max frames used for context
         trimmed_real_frames_count = min(real_frames_available_count, max_real_frames_used_for_context)
-        if trimmed_real_frames_count != real_frames_available_count:
-            print(f"Truncating video from {real_frames_available_count} to {trimmed_real_frames_count}, enough to populate context")
+        if trimmed_real_frames_count < real_frames_available_count:
+            print(f"Truncating video frames from {real_frames_available_count} to {trimmed_real_frames_count}, enough to populate context")
 
         # Truncate to nearest latent size (multiple of 4)
         frames_to_encode_count = (trimmed_real_frames_count // latent_size_factor) * latent_size_factor
         if frames_to_encode_count != trimmed_real_frames_count:
-            print(f"Truncating video from {trimmed_real_frames_count} to {frames_to_encode_count} frames for latent size compatibility")
+            print(f"Truncating video frames from {trimmed_real_frames_count} to {frames_to_encode_count}, for latent size compatibility")
 
         return frames_to_encode_count
 
