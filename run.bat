@@ -1,3 +1,4 @@
+@echo off
 echo Starting FramePack-Studio...
 
 REM Check if Python is installed (basic check)
@@ -7,4 +8,15 @@ if %errorlevel% neq 0 (
     goto end
 )
 
-python studio.py
+if exist "%cd%/venv/Scripts/python.exe" (
+
+"%cd%/venv/Scripts/python.exe" studio.py
+
+) else (
+
+echo Error: Virtual Environment for Python not found. Did you install correctly?
+goto end 
+
+)
+
+:end

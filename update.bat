@@ -30,13 +30,14 @@ if %errorlevel% neq 0 (
 
 echo Git pull successful.
 
-REM Attempt to update dependencies if Python is available
-where python >nul 2>&1
+REM Attempt to update dependencies if Virtual Environment is available
+if exist "%cd%/venv/Scripts/python.exe" (
+
 if %errorlevel% equ 0 (
     echo Updating dependencies using pip...
     REM This assumes there's a requirements.txt file in the root
     REM Using --upgrade to update existing packages
-    pip install --upgrade -r requirements.txt
+    "%cd%/venv/Scripts/python.exe" -m pip install --upgrade -r requirements.txt
 
     REM Check if pip update was successful
     if %errorlevel% neq 0 (
@@ -47,6 +48,14 @@ if %errorlevel% equ 0 (
 ) else (
     echo Skipping dependency update as Python is not available.
 )
+
+) else (
+
+echo Error: Virtual Environment for Python not found. Did you install correctly?
+goto end 
+
+)
+
 
 
 echo Update complete.
