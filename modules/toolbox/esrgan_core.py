@@ -36,6 +36,16 @@ class ESRGANUpscaler:
         os.makedirs(self.gfpgan_model_dir, exist_ok=True) # Ensure GFPGAN model dir exists
         
         self.supported_models = {
+
+            "RealESRGAN_x2plus": {
+                "filename": "RealESRGAN_x2plus.pth",
+                "file_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+                "hf_repo_id": None,
+                "scale": 2,
+                "model_class": RRDBNet,
+                "model_params": dict(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2),
+                "description": "General purpose. Faster than x4 models due to smaller native output. Good for moderate upscaling."
+            },
             "RealESRGAN_x4plus": {
                 "filename": "RealESRGAN_x4plus.pth",
                 "file_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
@@ -62,15 +72,6 @@ class ESRGANUpscaler:
                 "scale": 4, "model_class": SRVGGNetCompact,
                 "model_params": dict(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type='prelu'),
                 "description": "Versatile SRVGG-based. Balances detail & naturalness. Has adjustable denoise strength." # Updated description
-            },
-            "RealESRGAN_x2plus": {
-                "filename": "RealESRGAN_x2plus.pth",
-                "file_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
-                "hf_repo_id": None,
-                "scale": 2,
-                "model_class": RRDBNet,
-                "model_params": dict(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2),
-                "description": "General purpose. Faster than x4 models due to smaller native output. Good for moderate upscaling."
             },
             "RealESRGAN_x4plus_anime_6B": {
                 "filename": "RealESRGAN_x4plus_anime_6B.pth",

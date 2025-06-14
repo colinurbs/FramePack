@@ -10,7 +10,8 @@ import subprocess
 import devicetorch
 import json
 import math
-import shutil # For moving files
+import shutil
+import traceback
 
 from datetime import datetime
 from pathlib import Path
@@ -34,35 +35,151 @@ class VideoProcessor:
         self.device_obj = torch.device(device_name_str) # Store device_obj
         self.esrgan_upscaler = ESRGANUpscaler(message_manager, self.device_obj)
         self.settings = settings
-        
+
         # FFmpeg/FFprobe paths and status flags
         self.ffmpeg_exe = None
         self.ffprobe_exe = None
         self.has_ffmpeg = False
         self.has_ffprobe = False
-        # --- NEW: Add source tracking ---
         self.ffmpeg_source = None
         self.ffprobe_source = None
-        
+
         self._tb_initialize_ffmpeg() # Finds executables and sets flags
 
         studio_output_dir = Path(self.settings.get("output_dir"))
         self.postprocessed_output_root_dir = studio_output_dir / "postprocessed_output"
         self._base_temp_output_dir = self.postprocessed_output_root_dir / "temp_processing"
         self._base_permanent_save_dir = self.postprocessed_output_root_dir / "saved_videos"
-        
+
         self.toolbox_video_output_dir = self._base_temp_output_dir
-        self.toolbox_permanent_save_dir = self._base_permanent_save_dir 
-        
-        # Ensure all necessary directories exist
+        self.toolbox_permanent_save_dir = self._base_permanent_save_dir
+
         os.makedirs(self.postprocessed_output_root_dir, exist_ok=True)
         os.makedirs(self._base_temp_output_dir, exist_ok=True)
         os.makedirs(self._base_permanent_save_dir, exist_ok=True)
-
-        self.extracted_frames_target_path = self.postprocessed_output_root_dir / "frames" / "extracted_frames"
+        
+        # Note: Renamed to a more generic name as it holds more than just extracted frames now
+        self.frames_io_dir = self.postprocessed_output_root_dir / "frames"
+        self.extracted_frames_target_path = self.frames_io_dir / "extracted_frames"
         os.makedirs(self.extracted_frames_target_path, exist_ok=True)
-        self.reassembled_video_target_path = self.postprocessed_output_root_dir / "frames" / "reassembled_videos"
+        self.reassembled_video_target_path = self.frames_io_dir / "reassembled_videos"
         os.makedirs(self.reassembled_video_target_path, exist_ok=True)
+
+    # --- NEW BATCH PROCESSING FUNCTION ---
+    def tb_process_video_batch(self, video_paths: list, pipeline_config: dict, progress=gr.Progress()):
+        """
+        Processes a batch of videos according to a defined pipeline of operations.
+        - Batch jobs are ALWAYS saved to a new, unique, timestamped folder in 'saved_videos'.
+        - Single video pipeline jobs respect the 'Autosave' setting for the FINAL output only.
+        - Intermediate files are always created in and cleaned from the temp directory.
+        - The very last successfully processed video (from single or batch) is kept for the UI.
+        """
+        original_autosave_state = self.settings.get("toolbox_autosave_enabled", True)
+        is_batch_job = len(video_paths) > 1
+        batch_output_dir = None
+        last_successful_video_path_for_ui = None
+
+        try:
+            if is_batch_job:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                batch_output_dir = self._base_permanent_save_dir / f"batch_process_{timestamp}"
+                os.makedirs(batch_output_dir, exist_ok=True)
+                self.message_manager.add_message(f"Batch outputs will be saved to: {batch_output_dir}", "SUCCESS")
+
+            self.set_autosave_mode(False, silent=True)
+
+            operations = pipeline_config.get("operations", [])
+            if not operations:
+                self.message_manager.add_warning("No operations were selected for the pipeline. Nothing to do.")
+                return None
+
+            op_names = [op['name'].replace('_', ' ').title() for op in operations]
+            self.message_manager.add_message(f"🚀 Starting pipeline for {len(video_paths)} videos. Pipeline: {' -> '.join(op_names)}")
+
+            total_videos = len(video_paths)
+
+            for i, original_video_path in enumerate(video_paths):
+                progress(i / total_videos, desc=f"Video {i+1}/{total_videos}: {os.path.basename(original_video_path)}")
+                self.message_manager.add_message(f"\n--- Processing Video {i+1}/{total_videos}: {os.path.basename(original_video_path)} ---", "INFO")
+
+                current_video_path = original_video_path
+                video_failed = False
+                path_to_clean = None
+                
+                for op_config in operations:
+                    op_name = op_config["name"]
+                    op_params = op_config["params"]
+                    
+                    self.message_manager.add_message(f"  -> Step: Applying {op_name.replace('_', ' ')}...")
+                    output_path = None
+                    try:
+                        if op_name == "upscale": output_path = self.tb_upscale_video(current_video_path, **op_params, progress=progress)
+                        elif op_name == "frame_adjust": output_path = self.tb_process_frames(current_video_path, **op_params, progress=progress)
+                        elif op_name == "filters": output_path = self.tb_apply_filters(current_video_path, **op_params, progress=progress)
+                        elif op_name == "loop": output_path = self.tb_create_loop(current_video_path, **op_params, progress=progress)
+
+                        if output_path and os.path.exists(output_path):
+                            self.message_manager.add_success(f"  -> Step '{op_name}' completed. Output: {os.path.basename(output_path)}")
+                            if path_to_clean and os.path.exists(path_to_clean):
+                                try:
+                                    os.remove(path_to_clean)
+                                    self.message_manager.add_message(f"  -> Cleaned intermediate file: {os.path.basename(path_to_clean)}", "DEBUG")
+                                except OSError as e:
+                                    self.message_manager.add_warning(f"Could not clean intermediate file {path_to_clean}: {e}")
+
+                            current_video_path = output_path
+                            path_to_clean = output_path
+                        else:
+                            video_failed = True; break
+                    except Exception as e:
+                        video_failed = True
+                        self.message_manager.add_error(f"An unexpected error occurred during step '{op_name}': {e}")
+                        self.message_manager.add_error(traceback.format_exc())
+                        break
+
+                if not video_failed:
+                    final_temp_path = current_video_path
+                    is_last_video_in_batch = (i == total_videos - 1)
+                    
+                    if is_batch_job:
+                        # For batch jobs, copy the final output to the permanent batch folder.
+                        final_dest_path = batch_output_dir / os.path.basename(final_temp_path)
+                        shutil.copy2(final_temp_path, final_dest_path) # Use copy2 to keep temp file for UI
+                        self.message_manager.add_success(f"--- Successfully processed. Final output saved to: {final_dest_path} ---")
+
+                        if is_last_video_in_batch:
+                             # This is the very last video of the whole batch, keep its temp path for the UI player.
+                            last_successful_video_path_for_ui = final_temp_path
+                        else:
+                            # This is a completed video but not the last one in the batch, so we can clean its temp file.
+                            try: os.remove(final_temp_path)
+                            except OSError: pass
+                    else: # Single video pipeline run.
+                        if original_autosave_state:
+                            final_dest_path = self._base_permanent_save_dir / os.path.basename(final_temp_path)
+                            shutil.move(final_temp_path, final_dest_path) # Move, as it's saved permanently
+                            self.message_manager.add_success(f"--- Successfully processed. Final output saved to: {final_dest_path} ---")
+                            last_successful_video_path_for_ui = final_dest_path
+                        else:
+                            # Autosave off, so the final file remains in the temp folder for the UI.
+                            self.message_manager.add_success(f"--- Successfully processed. Final output is in temp folder: {final_temp_path} ---")
+                            last_successful_video_path_for_ui = final_temp_path
+                else:
+                    self.message_manager.add_warning(f"--- Processing failed for {os.path.basename(original_video_path)} ---")
+                    if path_to_clean and os.path.exists(path_to_clean):
+                        try: os.remove(path_to_clean)
+                        except OSError as e: self.message_manager.add_warning(f"Could not clean failed intermediate file {path_to_clean}: {e}")
+
+                gc.collect()
+                devicetorch.empty_cache(torch)
+
+            progress(1.0, desc="Pipeline complete.")
+            self.message_manager.add_message("\n✅ Pipeline processing finished.", "SUCCESS")
+            return last_successful_video_path_for_ui
+            
+        finally:
+            # Restore the user's original autosave setting silently.
+            self.set_autosave_mode(original_autosave_state, silent=True)
 
     def _tb_initialize_ffmpeg(self):
         """Finds FFmpeg/FFprobe and sets status flags and sources."""
@@ -75,7 +192,7 @@ class VideoProcessor:
 
         self.has_ffmpeg = bool(self.ffmpeg_exe)
         self.has_ffprobe = bool(self.ffprobe_exe)
-        
+
         self._report_ffmpeg_status()
 
     def _tb_find_ffmpeg_executables(self):
@@ -89,7 +206,6 @@ class VideoProcessor:
         ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
         ffprobe_name = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
 
-        # --- Priority 1: Bundled ---
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             bin_dir = os.path.join(script_dir, 'bin')
@@ -102,10 +218,8 @@ class VideoProcessor:
                 ffprobe_path = bundled_ffprobe
                 ffprobe_source = "Bundled"
         except Exception:
-            pass # Silently fail and move to next priority
+            pass
 
-        # --- Priority 2: System PATH ---
-        # Use shutil.which to find executables in the system's PATH
         if not ffmpeg_path:
             path_from_env = shutil.which(ffmpeg_name)
             if path_from_env:
@@ -117,8 +231,6 @@ class VideoProcessor:
                 ffprobe_path = path_from_env
                 ffprobe_source = "System PATH"
 
-        # --- Priority 3: imageio-ffmpeg ---
-        # This will only provide ffmpeg, not ffprobe.
         if not ffmpeg_path:
             try:
                 imageio_ffmpeg_exe = imageio.plugins.ffmpeg.get_exe()
@@ -126,48 +238,122 @@ class VideoProcessor:
                     ffmpeg_path = imageio_ffmpeg_exe
                     ffmpeg_source = "imageio-ffmpeg"
             except Exception:
-                pass # Silently fail
+                pass
 
         return ffmpeg_path, ffmpeg_source, ffprobe_path, ffprobe_source
 
     def _report_ffmpeg_status(self):
         """Provides a summary of FFmpeg/FFprobe status based on what was found."""
-        # Ideal case: Bundled version is used
         if self.ffmpeg_source == "Bundled" and self.ffprobe_source == "Bundled":
             self.message_manager.add_message(f"Bundled FFmpeg found: {self.ffmpeg_exe}", "SUCCESS")
             self.message_manager.add_message(f"Bundled FFprobe found: {self.ffprobe_exe}", "SUCCESS")
             self.message_manager.add_message("All video and audio features are enabled.", "SUCCESS")
             return
 
-        # Fallback cases: Report what was found and where
         if self.has_ffmpeg:
             self.message_manager.add_message(f"FFmpeg found via {self.ffmpeg_source}: {self.ffmpeg_exe}", "SUCCESS")
         else:
-            self.message_manager.add_error(
-                "Critical: FFmpeg executable could not be found. "
-                "Most video processing operations will fail. Please try running the setup script."
-            )
+            self.message_manager.add_error("Critical: FFmpeg executable could not be found. Most video processing operations will fail. Please try running the setup script.")
 
         if self.has_ffprobe:
             self.message_manager.add_message(f"FFprobe found via {self.ffprobe_source}: {self.ffprobe_exe}", "SUCCESS")
         else:
-            self.message_manager.add_warning(
-                "FFprobe not found. Audio detection and full video analysis will be limited."
-            )
-            # Add a specific nag if the bundled version should exist but doesn't
+            self.message_manager.add_warning("FFprobe not found. Audio detection and full video analysis will be limited.")
             if self.ffmpeg_source != "Bundled":
-                 self.message_manager.add_warning(
-                    "For full functionality, please run the 'setup_ffmpeg.py' script."
-                 )
+                 self.message_manager.add_warning("For full functionality, please run the 'setup_ffmpeg.py' script.")
 
-    def set_autosave_mode(self, autosave_enabled: bool):
+    def tb_get_frames_from_folder(self, folder_name: str) -> list:
+        """
+        Gets a sorted list of image file paths from a given folder name.
+        This is the backend for the "Load Frames to Studio" button.
+        """
+        if not folder_name:
+            return []
+
+        full_folder_path = os.path.join(self.extracted_frames_target_path, folder_name)
+        if not os.path.isdir(full_folder_path):
+            self.message_manager.add_error(f"Cannot load frames: Directory not found at {full_folder_path}")
+            return []
+
+        frame_files = []
+        try:
+            for filename in os.listdir(full_folder_path):
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
+                    frame_files.append(os.path.join(full_folder_path, filename))
+
+            # Natural sort to handle frame_0, frame_1, ... frame_10 correctly
+            def natural_sort_key(s):
+                return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+
+            frame_files.sort(key=natural_sort_key)
+            return frame_files
+
+        except Exception as e:
+            self.message_manager.add_error(f"Error reading frames from '{folder_name}': {e}")
+            return []
+
+    def tb_delete_single_frame(self, frame_path_to_delete: str) -> str:
+        """Deletes a single frame file from the disk, logs the action, and returns a status message."""
+        if not frame_path_to_delete or not isinstance(frame_path_to_delete, str):
+            # This message is returned to the app's info box
+            msg_for_infobox = "Error: Invalid frame path provided for deletion."
+            # The message manager gets a more detailed log entry
+            self.message_manager.add_error("Could not delete frame: Invalid path provided to processor.")
+            return msg_for_infobox
+
+        try:
+            filename = os.path.basename(frame_path_to_delete)
+            if os.path.isfile(frame_path_to_delete):
+                os.remove(frame_path_to_delete)
+                # Add a success message to the main log
+                self.message_manager.add_success(f"Deleted frame: {filename}")
+                # Return a concise status for the info box
+                return f"✅ Deleted: {filename}"
+            else:
+                self.message_manager.add_error(f"Could not delete frame. File not found: {frame_path_to_delete}")
+                return f"Error: Frame not found"
+        except OSError as e:
+            self.message_manager.add_error(f"Error deleting frame {filename}: {e}")
+            return f"Error deleting frame: {e}"
+
+    def tb_save_single_frame(self, source_frame_path: str) -> str | None:
+        """Saves a copy of a single frame to the permanent 'saved_videos' directory."""
+        if not source_frame_path or not os.path.isfile(source_frame_path):
+            self.message_manager.add_error("Source frame to save does not exist or is invalid.")
+            return None
+
+        try:
+            source_path_obj = Path(source_frame_path)
+            parent_folder_name = source_path_obj.parent.name
+            frame_filename = source_path_obj.name
+            
+            # Create a descriptive filename to avoid collisions
+            timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+            dest_filename = f"saved_frame_{parent_folder_name}_{timestamp}_{frame_filename}"
+            
+            destination_path = os.path.join(self.toolbox_permanent_save_dir, dest_filename)
+            
+            os.makedirs(self.toolbox_permanent_save_dir, exist_ok=True)
+            shutil.copy2(source_frame_path, destination_path)
+            
+            self.message_manager.add_success(f"Saved frame to permanent storage: {destination_path}")
+            return destination_path
+        except Exception as e:
+            self.message_manager.add_error(f"Error saving frame to permanent storage: {e}")
+            self.message_manager.add_error(traceback.format_exc())
+            return None
+
+
+    def set_autosave_mode(self, autosave_enabled: bool, silent: bool = False):
         if autosave_enabled:
             self.toolbox_video_output_dir = self._base_permanent_save_dir
-            self.message_manager.add_message("Autosave ENABLED: Processed videos will be saved to the permanent folder.", "SUCCESS")
+            if not silent:
+                self.message_manager.add_message("Autosave ENABLED: Processed videos will be saved to the permanent folder.", "SUCCESS")
         else:
             self.toolbox_video_output_dir = self._base_temp_output_dir
-            self.message_manager.add_message("Autosave DISABLED: Processed videos will be saved to the temporary folder.", "INFO")
-    
+            if not silent:
+                self.message_manager.add_message("Autosave DISABLED: Processed videos will be saved to the temporary folder.", "INFO")
+
     def _tb_log_ffmpeg_error(self, e_ffmpeg: subprocess.CalledProcessError, operation_description: str):
         self.message_manager.add_error(f"FFmpeg failed during {operation_description}.")
         ffmpeg_stderr_str = e_ffmpeg.stderr.strip() if e_ffmpeg.stderr else ""
@@ -176,12 +362,62 @@ class VideoProcessor:
         details_log = []
         if ffmpeg_stderr_str: details_log.append(f"FFmpeg Stderr: {ffmpeg_stderr_str}")
         if ffmpeg_stdout_str: details_log.append(f"FFmpeg Stdout: {ffmpeg_stdout_str}")
-        
+
         if details_log:
             self.message_manager.add_message("FFmpeg Output:\n" + "\n".join(details_log), "INFO")
         else:
             self.message_manager.add_message(f"No specific output from FFmpeg. (Return code: {e_ffmpeg.returncode}, Command: '{e_ffmpeg.cmd}')", "INFO")
 
+    def _tb_get_video_frame_count(self, video_path: str) -> int | None:
+        """
+        Uses ffprobe to get an accurate frame count by requesting JSON output for robust parsing.
+        Tries a fast metadata read first, then falls back to a slower but more accurate full stream count.
+        """
+        if not self.has_ffprobe:
+            self.message_manager.add_message("Cannot get frame count: ffprobe not found.", "DEBUG")
+            return None
+
+        # --- Tier 1: Fast metadata read using JSON output ---
+        try:
+            ffprobe_cmd_fast = [
+                self.ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames", "-of", "json", video_path
+            ]
+            result = subprocess.run(ffprobe_cmd_fast, capture_output=True, text=True, check=True, errors='ignore')
+            data = json.loads(result.stdout)
+            frame_count_str = data.get("streams", [{}])[0].get("nb_frames", "N/A")
+
+            if frame_count_str.isdigit() and int(frame_count_str) > 0:
+                self.message_manager.add_message(f"Frame count from metadata: {frame_count_str}", "DEBUG")
+                return int(frame_count_str)
+            else:
+                 self.message_manager.add_warning(f"Fast metadata frame count was invalid ('{frame_count_str}'). Falling back to full count.")
+        except Exception as e:
+            self.message_manager.add_warning(f"Fast metadata read failed: {e}. Falling back to full count.")
+
+        # --- Tier 2: Slow, accurate full-stream count using JSON output ---
+        try:
+            self.message_manager.add_message("Performing full, accurate frame count with ffprobe (this may take a moment)...", "INFO")
+            ffprobe_cmd_accurate = [
+                self.ffprobe_exe, "-v", "error", "-count_frames",
+                "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames",
+                "-of", "json", video_path
+            ]
+            result = subprocess.run(ffprobe_cmd_accurate, capture_output=True, text=True, check=True, errors='ignore')
+            data = json.loads(result.stdout)
+            frame_count_str = data.get("streams", [{}])[0].get("nb_read_frames", "N/A")
+
+            if frame_count_str.isdigit() and int(frame_count_str) > 0:
+                self.message_manager.add_message(f"Accurate frame count from full scan: {frame_count_str}", "DEBUG")
+                return int(frame_count_str)
+            else:
+                 self.message_manager.add_error(f"Full ffprobe scan returned invalid frame count: '{frame_count_str}'.")
+                 return None
+        except Exception as e:
+            self.message_manager.add_error(f"Critical error during full ffprobe frame count: {e}")
+            self.message_manager.add_error(traceback.format_exc())
+            return None
+            
     def tb_extract_frames(self, video_path, extraction_rate, progress=gr.Progress()):
         if video_path is None:
             self.message_manager.add_warning("No input video for frame extraction.")
@@ -192,7 +428,7 @@ class VideoProcessor:
 
         resolved_video_path = str(Path(video_path).resolve())
         output_folder_name = self._tb_generate_output_folder_path(
-            resolved_video_path, 
+            resolved_video_path,
             suffix=f"extracted_every_{extraction_rate}")
         os.makedirs(output_folder_name, exist_ok=True)
 
@@ -200,58 +436,45 @@ class VideoProcessor:
             f"Starting frame extraction for {os.path.basename(resolved_video_path)} (every {extraction_rate} frame(s))."
         )
         self.message_manager.add_message(f"Outputting to: {output_folder_name}")
-        progress(0, desc="Initializing frame extraction...")
-        
-        reader = None 
+
+        reader = None
         try:
-            reader = imageio.get_reader(resolved_video_path) # Default 'ffmpeg' plugin if available
-            total_frames = None
-            try:
-                # Try to get nframes metadata first, as count_frames can be slow or Inf for streams
-                meta_nframes = reader.get_meta_data().get('nframes')
-                if meta_nframes and meta_nframes != float('inf'):
-                    total_frames = int(meta_nframes)
-                elif hasattr(reader, 'count_frames'): # Fallback to count_frames if available and nframes is not
-                    total_frames_counted = reader.count_frames()
-                    if total_frames_counted != float('inf'):
-                        total_frames = total_frames_counted
-            except Exception: 
-                self.message_manager.add_warning("Could not accurately determine total frames. Progress might be approximate.")
-                total_frames = None
-
-
-            extracted_count = 0
-            frame_iterable = reader
+            total_frames = self._tb_get_video_frame_count(resolved_video_path)
+            
+            # If we know the total frames, we can provide accurate progress.
             if total_frames:
-                frame_iterable = progress.tqdm(reader, total=total_frames, desc="Extracting frames")
-            else: 
-                self.message_manager.add_message("Processing frames (total unknown)...")
-
-
-            for i, frame in enumerate(frame_iterable):
-                if not total_frames and i % 100 == 0: 
-                    progress(i / (i + 1000.0), desc=f"Extracting frame {i+1}...") 
+                progress(0, desc=f"Extracting 0 / {total_frames} frames...")
+            else:
+                self.message_manager.add_warning("Could not determine total frames. Progress will be indeterminate.")
+                progress(0, desc="Extracting frames (total unknown)...")
                 
+            reader = imageio.get_reader(resolved_video_path)
+            extracted_count = 0
+            
+            # --- MANUAL PROGRESS LOOP ---
+            for i, frame in enumerate(reader):
+                # Update progress manually every few frames to avoid overwhelming the UI
+                if total_frames and i % 10 == 0:
+                    progress(i / total_frames, desc=f"Extracting {i} / {total_frames} frames...")
+
                 if i % extraction_rate == 0:
                     frame_filename = f"frame_{extracted_count:06d}.png"
                     output_frame_path = os.path.join(output_folder_name, frame_filename)
                     imageio.imwrite(output_frame_path, frame, format='PNG')
                     extracted_count += 1
             
+            # --- FINAL UPDATE ---
             progress(1.0, desc="Extraction complete.")
             self.message_manager.add_success(f"Successfully extracted {extracted_count} frames to: {output_folder_name}")
             return output_folder_name
 
         except Exception as e:
             self.message_manager.add_error(f"Error during frame extraction: {e}")
-            import traceback
             self.message_manager.add_error(traceback.format_exc())
-            if "Could not find a backend" in str(e) or "No such file or directory: 'ffmpeg'" in str(e).lower():
-                 self.message_manager.add_error("This might indicate an issue with FFmpeg backend for imageio. Ensure 'imageio-ffmpeg' is installed or FFmpeg is in PATH.")
             progress(1.0, desc="Error during extraction.")
             return None
         finally:
-            if reader: 
+            if reader:
                 reader.close()
             gc.collect()
             
@@ -264,8 +487,7 @@ class VideoProcessor:
                 d for d in os.listdir(self.extracted_frames_target_path)
                 if os.path.isdir(os.path.join(self.extracted_frames_target_path, d))
             ]
-            folders.sort() 
-            # self.message_manager.add_message(f"Found {len(folders)} extracted frame folders.") # Can be noisy
+            folders.sort()
             return folders
         except Exception as e:
             self.message_manager.add_error(f"Error scanning for extracted frame folders: {e}")
@@ -275,29 +497,26 @@ class VideoProcessor:
         if not folder_name_to_delete:
             self.message_manager.add_warning("No folder selected for deletion.")
             return False
-        
+
         folder_path_to_delete = os.path.join(self.extracted_frames_target_path, folder_name_to_delete)
 
         if not os.path.exists(folder_path_to_delete) or not os.path.isdir(folder_path_to_delete):
             self.message_manager.add_error(f"Folder not found or is not a directory: {folder_path_to_delete}")
             return False
-        
+
         try:
             shutil.rmtree(folder_path_to_delete)
             self.message_manager.add_success(f"Successfully deleted folder: {folder_name_to_delete}")
             return True
         except Exception as e:
             self.message_manager.add_error(f"Error deleting folder '{folder_name_to_delete}': {e}")
-            self.message_manager.add_error(traceback.format_exc() if 'traceback' in sys.modules else str(e))
+            self.message_manager.add_error(traceback.format_exc())
             return False
-            
+
     def tb_reassemble_frames_to_video(self, frames_source, output_fps, output_base_name_override=None, progress=gr.Progress()):
         if not frames_source:
             self.message_manager.add_warning("No frames source (folder or files) provided for reassembly.")
             return None
-        
-        # This operation primarily uses imageio.
-        # FFmpeg dependency is indirect via imageio-ffmpeg for mimwrite.
 
         try:
             output_fps = int(output_fps)
@@ -309,68 +528,50 @@ class VideoProcessor:
             return None
 
         self.message_manager.add_message(f"Starting frame reassembly to video at {output_fps} FPS.")
-        
+
         frame_info_list = []
-        frames_data_prepared = False # To track if frames_data list was populated for cleanup
+        frames_data_prepared = False
 
         try:
+            # This logic now primarily handles a directory path string
             if isinstance(frames_source, str) and os.path.isdir(frames_source):
                 self.message_manager.add_message(f"Processing frames from directory: {frames_source}")
-                for filename in os.listdir(frames_source):
-                    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
-                        full_path = os.path.join(frames_source, filename)
-                        frame_info_list.append({
-                            'original_like_filename': filename,
-                            'temp_path': full_path
-                        })
-            elif isinstance(frames_source, list): # List of Gradio FileData objects
-                self.message_manager.add_message(f"Processing {len(frames_source)} uploaded files for reassembly.")
-                for temp_file_wrapper in frames_source:
-                    # Gradio temp files might have generic names, try to use original if available
-                    original_like_filename = getattr(temp_file_wrapper, 'orig_name', None) or os.path.basename(temp_file_wrapper.name)
+                # Use our existing function to get a sorted list of frame paths
+                sorted_frame_paths = self.tb_get_frames_from_folder(os.path.basename(frames_source))
+                for full_path in sorted_frame_paths:
                     frame_info_list.append({
-                        'original_like_filename': original_like_filename,
-                        'temp_path': temp_file_wrapper.name
+                        'original_like_filename': os.path.basename(full_path),
+                        'temp_path': full_path
                     })
             else:
-                self.message_manager.add_error("Invalid frames_source type for reassembly.")
+                self.message_manager.add_error("Invalid frames_source type for reassembly. Expected a directory path.")
                 return None
-            
+
             if not frame_info_list:
                 self.message_manager.add_warning("No valid image files found in the provided source to reassemble.")
                 return None
 
-            def natural_sort_key_for_dict(item):
-                filename = item['original_like_filename']
-                return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', filename)]
-
-            frame_info_list.sort(key=natural_sort_key_for_dict)
-            self.message_manager.add_message(f"Sorted {len(frame_info_list)} frames based on their filenames.")
-            
-            # For debugging, log first few sorted names
-            # if frame_info_list:
-            #     debug_sorted_names = [info['original_like_filename'] for info in frame_info_list[:min(5, len(frame_info_list))]]
-            #     self.message_manager.add_message(f"DEBUG: First {len(debug_sorted_names)} sorted filenames: {debug_sorted_names}", "DEBUG")
+            self.message_manager.add_message(f"Found {len(frame_info_list)} frames for reassembly.")
 
             output_file_basename = "reassembled_video"
             if output_base_name_override and isinstance(output_base_name_override, str) and output_base_name_override.strip():
                 sanitized_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in output_base_name_override.strip())
                 output_file_basename = Path(sanitized_name).stem
-                if not output_file_basename: output_file_basename = "reassembled_video" 
+                if not output_file_basename: output_file_basename = "reassembled_video"
                 self.message_manager.add_message(f"Using custom output video base name: {output_file_basename}")
 
             output_video_path = self._tb_generate_output_path(
                 input_material_name=output_file_basename,
-                suffix=f"{output_fps}fps_reassembled", 
-                target_dir=self.reassembled_video_target_path, # Specific target for reassembled
+                suffix=f"{output_fps}fps_reassembled",
+                target_dir=self.reassembled_video_target_path,
                 ext=".mp4"
             )
 
             frames_data = []
-            frames_data_prepared = True 
+            frames_data_prepared = True
 
             self.message_manager.add_message("Reading frame images (in sorted order)...")
-            
+
             frame_iterator = frame_info_list
             if frame_info_list and progress is not None and hasattr(progress, 'tqdm'):
                  frame_iterator = progress.tqdm(frame_info_list, desc="Reading frames")
@@ -383,31 +584,160 @@ class VideoProcessor:
                         self.message_manager.add_warning(f"Skipping non-standard image file: {filename_for_log}.")
                         continue
                     frames_data.append(imageio.imread(frame_actual_path))
-                except Exception as e_read_frame: 
+                except Exception as e_read_frame:
                     self.message_manager.add_warning(f"Could not read frame ({filename_for_log}): {e_read_frame}. Skipping.")
-            
+
             if not frames_data:
                 self.message_manager.add_error("No valid frames could be successfully read for reassembly.")
                 return None
 
             self.message_manager.add_message(f"Writing {len(frames_data)} frames to video: {output_video_path}")
-            
-            # Ensure macro_block_size is None if not multiple of 16, or handle fps issues
-            imageio.mimwrite(output_video_path, frames_data, fps=output_fps, quality=VIDEO_QUALITY, macro_block_size=None) # macro_block_size often problematic
+            imageio.mimwrite(output_video_path, frames_data, fps=output_fps, quality=VIDEO_QUALITY, macro_block_size=None)
 
             self.message_manager.add_success(f"Successfully reassembled {len(frames_data)} frames into: {output_video_path}")
             return output_video_path
 
         except Exception as e:
             self.message_manager.add_error(f"Error during frame reassembly: {e}")
-            import traceback
             self.message_manager.add_error(traceback.format_exc())
             if "Could not find a backend" in str(e) or "No such file or directory: 'ffmpeg'" in str(e).lower():
                  self.message_manager.add_error("This might indicate an issue with FFmpeg backend for imageio. Ensure 'imageio-ffmpeg' is installed or FFmpeg is in PATH.")
             return None
         finally:
-            if frames_data_prepared and 'frames_data' in locals(): 
-                del frames_data # Explicitly delete large list of frames
+            if frames_data_prepared and 'frames_data' in locals():
+                del frames_data
+            gc.collect()
+
+    def _tb_get_video_duration(self, video_path: str) -> str | None:
+        """Uses ffprobe to get the duration of a video file as a string."""
+        if not self.has_ffprobe:
+            return None
+        try:
+            ffprobe_cmd = [
+                self.ffprobe_exe, "-v", "error", "-show_entries",
+                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path
+            ]
+            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True, errors='ignore')
+            return result.stdout.strip()
+        except Exception:
+            return None
+            
+    def tb_join_videos(self, video_paths: list, output_base_name_override=None, progress=gr.Progress()):
+        if not video_paths or len(video_paths) < 2:
+            self.message_manager.add_warning("Please select at least two videos to join.")
+            return None
+        if not self.has_ffmpeg:
+            self.message_manager.add_error("FFmpeg is required for joining videos. This operation cannot proceed.")
+            return None
+
+        self.message_manager.add_message(f"🚀 Starting video join process for {len(video_paths)} videos...")
+        progress(0.1, desc="Analyzing input videos...")
+
+        # --- 1. STANDARDIZE DIMENSIONS ---
+        # Get dimensions of the first video to use as the standard for all others.
+        first_video_dims = self._tb_get_video_dimensions(video_paths[0])
+        if not all(first_video_dims):
+            self.message_manager.add_error("Could not determine dimensions of the first video. Cannot proceed.")
+            return None
+        target_w, target_h = first_video_dims
+        self.message_manager.add_message(f"Standardizing all videos to {target_w}x{target_h} for joining.")
+
+        # --- 2. BUILD THE FFMPEG COMMAND ---
+        ffmpeg_cmd = [self.ffmpeg_exe, "-y", "-loglevel", "error"]
+        filter_complex_parts = []
+        video_stream_labels = []
+        audio_stream_labels = []
+
+        # Loop through each input video to prepare its streams.
+        for i, path in enumerate(video_paths):
+            ffmpeg_cmd.extend(["-i", str(Path(path).resolve())])
+            
+            # --- VIDEO STREAM PREPARATION ---
+            video_label = f"v{i}"
+            # Scale video, pad to fit, set aspect ratio, and ensure standard pixel format.
+            filter_complex_parts.append(
+                f"[{i}:v:0]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:-1:-1:color=black,setsar=1,format=yuv420p[{video_label}]"
+            )
+            video_stream_labels.append(f"[{video_label}]")
+            
+            # --- AUDIO STREAM PREPARATION ---
+            audio_label = f"a{i}"
+            if self._tb_has_audio_stream(path):
+                # If audio exists, standardize it to a common format.
+                filter_complex_parts.append(
+                    f"[{i}:a:0]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{audio_label}]"
+                )
+            else:
+                # If no audio, get the video's duration first.
+                duration = self._tb_get_video_duration(path)
+                if duration:
+                    # Then, generate a silent audio track of that exact duration.
+                    self.message_manager.add_message(f"'{Path(path).name}' has no audio. Generating silent track of {float(duration):.2f}s.", "INFO")
+                    filter_complex_parts.append(
+                        f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration={duration}[{audio_label}]"
+                    )
+                else:
+                    # If we can't get duration, we can't create a silent track, so we must skip it.
+                    self.message_manager.add_warning(f"Could not get duration for '{Path(path).name}' to generate silent audio. This track's audio will be skipped.")
+                    continue 
+            audio_stream_labels.append(f"[{audio_label}]")
+
+        # --- 3. CONCATENATE THE STREAMS ---
+        # Join all the prepared video and audio streams together into final output streams.
+        filter_complex_parts.append(f"{''.join(video_stream_labels)}concat=n={len(video_paths)}:v=1:a=0[outv]")
+        
+        # Only add the audio concat filter if we successfully prepared audio streams.
+        if audio_stream_labels:
+            filter_complex_parts.append(f"{''.join(audio_stream_labels)}concat=n={len(audio_stream_labels)}:v=0:a=1[outa]")
+        
+        final_filter_complex = ";".join(filter_complex_parts)
+        ffmpeg_cmd.extend(["-filter_complex", final_filter_complex])
+
+        # --- 4. MAP AND ENCODE THE FINAL VIDEO ---
+        # Map the final concatenated video stream to the output.
+        ffmpeg_cmd.extend(["-map", "[outv]"])
+        # If we have a final audio stream, map that too.
+        if audio_stream_labels:
+            ffmpeg_cmd.extend(["-map", "[outa]"])
+
+        # Determine the output filename.
+        if output_base_name_override and isinstance(output_base_name_override, str) and output_base_name_override.strip():
+             sanitized_name = "".join(c for c in output_base_name_override.strip() if c.isalnum() or c in (' ', '_', '-')).strip()
+             base_name_to_use = Path(sanitized_name).stem if sanitized_name else Path(video_paths[0]).stem
+        else:
+            base_name_to_use = Path(video_paths[0]).stem
+            
+        output_path = self._tb_generate_output_path(
+            base_name_to_use,
+            suffix=f"joined_{len(video_paths)}_videos",
+            target_dir=self.toolbox_video_output_dir
+        )
+        
+        # Set standard, high-compatibility encoding options.
+        ffmpeg_cmd.extend([
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", output_path
+        ])
+
+        # --- 5. EXECUTE THE COMMAND ---
+        try:
+            self.message_manager.add_message("Running FFmpeg to join videos. This may take a while...")
+            progress(0.5, desc=f"Joining {len(video_paths)} videos...")
+            
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, errors='ignore')
+            
+            progress(1.0, desc="Join complete.")
+            self.message_manager.add_success(f"✅ Videos successfully joined! Output: {output_path}")
+            return output_path
+            
+        except subprocess.CalledProcessError as e_join:
+            self._tb_log_ffmpeg_error(e_join, "video joining")
+            return None
+        except Exception as e:
+            self.message_manager.add_error(f"An unexpected error occurred during video joining: {e}")
+            self.message_manager.add_error(traceback.format_exc())
+            return None
+        finally:
             gc.collect()
 
     def _tb_clean_filename(self, filename):
@@ -415,6 +745,90 @@ class VideoProcessor:
         filename = re.sub(r'_\d{6}_\d{4}', '', filename) # Another example
         return filename.strip('_')
 
+    def tb_export_video(self, video_path: str, export_format: str, quality_slider: int, max_width: int,
+                        output_base_name_override=None, progress=gr.Progress()):
+        if not video_path:
+            self.message_manager.add_warning("No input video for exporting.")
+            return None
+        if not self.has_ffmpeg:
+            self.message_manager.add_error("FFmpeg is required for exporting. This operation cannot proceed.")
+            return None
+
+        self.message_manager.add_message(f"🚀 Starting export to {export_format.upper()}...")
+        progress(0, desc=f"Preparing to export to {export_format.upper()}...")
+        
+        resolved_video_path = str(Path(video_path).resolve())
+        
+        # --- Base FFmpeg Command ---
+        ffmpeg_cmd = [self.ffmpeg_exe, "-y", "-loglevel", "error", "-i", resolved_video_path]
+        
+        # --- Video Filters (Resizing) ---
+        vf_parts = []
+        # The scale filter resizes while maintaining aspect ratio. '-2' ensures the height is an even number for codec compatibility.
+        vf_parts.append(f"scale={max_width}:-2")
+        
+        # --- Format-Specific Settings ---
+        ext = f".{export_format.lower()}"
+        
+        if export_format == "MP4":
+            # CRF (Constant Rate Factor) is the quality setting for x264. Lower is higher quality.
+            # We map our 0-100 slider to a good CRF range (e.g., 28 (low) to 18 (high)).
+            crf_value = int(28 - (quality_slider / 100) * 10)
+            self.message_manager.add_message(f"Exporting MP4 with CRF: {crf_value} (Quality: {quality_slider}%)")
+            ffmpeg_cmd.extend(["-c:v", "libx264", "-crf", str(crf_value), "-preset", "medium"])
+            ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "128k"]) # Keep audio, but compress it
+            
+        elif export_format == "WebM":
+            # Similar to MP4, but for the VP9 codec. A good CRF range is ~35 (low) to 25 (high).
+            crf_value = int(35 - (quality_slider / 100) * 10)
+            self.message_manager.add_message(f"Exporting WebM with CRF: {crf_value} (Quality: {quality_slider}%)")
+            ffmpeg_cmd.extend(["-c:v", "libvpx-vp9", "-crf", str(crf_value), "-b:v", "0"])
+            ffmpeg_cmd.extend(["-c:a", "libopus", "-b:a", "96k"]) # Use Opus for WebM audio
+
+        elif export_format == "GIF":
+            # High-quality GIF generation is a two-pass process.
+            self.message_manager.add_message("Generating high-quality GIF (2-pass)...")
+            # Pass 1: Generate a color palette.
+            palette_path = os.path.join(self._base_temp_output_dir, f"palette_{Path(video_path).stem}.png")
+            vf_parts.append("split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse")
+            ffmpeg_cmd.extend(["-an"]) # No audio in GIFs
+
+        if vf_parts:
+            ffmpeg_cmd.extend(["-vf", ",".join(vf_parts)])
+
+        # --- Output Path ---
+        if output_base_name_override and isinstance(output_base_name_override, str) and output_base_name_override.strip():
+             sanitized_name = "".join(c for c in output_base_name_override.strip() if c.isalnum() or c in (' ', '_', '-')).strip()
+             base_name_to_use = Path(sanitized_name).stem if sanitized_name else Path(video_path).stem
+        else:
+            base_name_to_use = Path(video_path).stem
+
+        output_path = self._tb_generate_output_path(
+            base_name_to_use,
+            suffix=f"exported_{quality_slider}q_{max_width}w",
+            target_dir=self.toolbox_video_output_dir,
+            ext=ext
+        )
+        ffmpeg_cmd.append(output_path)
+
+        # --- Execute ---
+        try:
+            progress(0.5, desc=f"Encoding to {export_format.upper()}...")
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, errors='ignore')
+            progress(1.0, desc="Export complete!")
+            self.message_manager.add_success(f"✅ Successfully exported to {export_format.upper()}! Output: {output_path}")
+            return output_path
+            
+        except subprocess.CalledProcessError as e:
+            self._tb_log_ffmpeg_error(e, f"export to {export_format.upper()}")
+            return None
+        except Exception as e:
+            self.message_manager.add_error(f"An unexpected error occurred during export: {e}")
+            self.message_manager.add_error(traceback.format_exc())
+            return None
+        finally:
+            gc.collect()
+            
     def _tb_generate_output_path(self, input_material_name, suffix, target_dir, ext=".mp4"):
         base_name = Path(input_material_name).stem 
         if not base_name: base_name = "untitled_video" 
@@ -456,7 +870,23 @@ class VideoProcessor:
         
         resolved_video_path = str(Path(video_path).resolve())
         analysis_report_lines = [] # Use a list to build the report string
-        
+
+        file_size_bytes = 0
+        file_size_display = "N/A"
+        try:
+            if os.path.exists(resolved_video_path):
+                file_size_bytes = os.path.getsize(resolved_video_path)
+                if file_size_bytes < 1024:
+                    file_size_display = f"{file_size_bytes} B"
+                elif file_size_bytes < 1024**2:
+                    file_size_display = f"{file_size_bytes/1024:.2f} KB"
+                elif file_size_bytes < 1024**3:
+                    file_size_display = f"{file_size_bytes/1024**2:.2f} MB"
+                else:
+                    file_size_display = f"{file_size_bytes/1024**3:.2f} GB"
+        except Exception as e:
+            self.message_manager.add_warning(f"Could not get file size: {e}")
+            
         # Variables to hold parsed info, initialized to defaults
         video_width, video_height = 0, 0
         num_frames_value = None # For the upscale warning
@@ -478,8 +908,7 @@ class VideoProcessor:
 
                 if not video_stream:
                     self.message_manager.add_error("No video stream found in the file (ffprobe).")
-                    # Fall through to imageio or return error, depending on desired strictness
-                    # For now, let's allow imageio to try
+
                 else:
                     analysis_source = "ffprobe"
                     duration_str = probe_data.get("format", {}).get("duration", "0") 
@@ -578,6 +1007,7 @@ class VideoProcessor:
         analysis_report_lines.append(f"Video Analysis ({analysis_source}):")
         analysis_report_lines.append(f"File: {os.path.basename(video_path)}")
         analysis_report_lines.append("------------------------------------")
+        analysis_report_lines.append(f"File Size: {file_size_display}")
         analysis_report_lines.append(f"Duration: {duration_display}")
         analysis_report_lines.append(f"Frame Rate: {fps_display}")
         analysis_report_lines.append(f"Resolution: {resolution_display}")
@@ -658,6 +1088,11 @@ class VideoProcessor:
         
         final_output_path = None 
         try:
+            interpolation_factor = 1
+            if "2x" in target_fps_mode: interpolation_factor = 2
+            elif "4x" in target_fps_mode: interpolation_factor = 4
+            should_interpolate = interpolation_factor > 1
+
             self.message_manager.add_message(
                 f"Starting frame processing for {os.path.basename(video_path)}: "
                 f"FPS Mode: {target_fps_mode}, Speed: {speed_factor}x"
@@ -688,39 +1123,46 @@ class VideoProcessor:
                     processed_frames = [video_frames[i] for i in indices]
                 self.message_manager.add_message(f"Speed adjustment (sampling) resulted in {len(processed_frames)} frames.")
             
-            should_interpolate = (target_fps_mode == "2x RIFE Interpolation")
-            
             if should_interpolate and len(processed_frames) > 1:
-                self.message_manager.add_message("Attempting to load RIFE model for 2x interpolation...")
+                self.message_manager.add_message(f"Attempting to load RIFE model for {interpolation_factor}x interpolation...")
                 if not self.rife_handler._ensure_model_downloaded_and_loaded():
                     self.message_manager.add_error("RIFE model could not be loaded. Skipping interpolation.")
                 else:
-                    self.message_manager.add_message("RIFE model loaded. Starting RIFE 2x interpolation...")
-                    interpolated_video_frames = []
-                    num_pairs = len(processed_frames) - 1
-                    for i in progress.tqdm(range(num_pairs), desc="RIFE Interpolating (2x)"):
-                        frame1_np, frame2_np = processed_frames[i], processed_frames[i+1]
-                        interpolated_video_frames.append(frame1_np) 
-                        middle_frame_np = self.rife_handler.interpolate_between_frames(frame1_np, frame2_np)
-                        if middle_frame_np is not None: interpolated_video_frames.append(middle_frame_np)
-                        else: interpolated_video_frames.append(frame1_np) # Duplicate on failure
-                    interpolated_video_frames.append(processed_frames[-1]) 
-                    processed_frames = interpolated_video_frames
+                    self.message_manager.add_message(f"RIFE model loaded. Starting RIFE {interpolation_factor}x interpolation...")
+                    
+                    # Loop for multiple passes of 2x interpolation (1 pass for 2x, 2 passes for 4x)
+                    num_passes = int(math.log2(interpolation_factor))
+                    for p in range(num_passes):
+                        self.message_manager.add_message(f"RIFE Pass {p+1}/{num_passes}: Interpolating frames...")
+                        interpolated_this_pass = []
+                        num_pairs = len(processed_frames) - 1
+                    
+                        # Use tqdm for the innermost loop of each pass
+                        for i in progress.tqdm(range(num_pairs), desc=f"RIFE Pass {p+1}/{num_passes} ({interpolation_factor}x)"):
+                            frame1_np, frame2_np = processed_frames[i], processed_frames[i+1]
+                            interpolated_this_pass.append(frame1_np) 
+                            middle_frame_np = self.rife_handler.interpolate_between_frames(frame1_np, frame2_np)
+                            if middle_frame_np is not None: interpolated_this_pass.append(middle_frame_np)
+                            else: interpolated_this_pass.append(frame1_np) # Duplicate on failure
+                        
+                        interpolated_this_pass.append(processed_frames[-1])
+                        processed_frames = interpolated_this_pass # Update for the next pass or for final output
                     # The video stream FPS itself doesn't change due to RIFE; it just has more frames.
                     # If RIFE is used, the perceived playback smoothness increases as if FPS doubled.
                     # The container FPS (current_fps) should reflect the intended playback rate of these frames.
                     # If original FPS was 30, and we RIFE, we now have 2x frames intended to still play over
                     # the same original duration segment, effectively meaning playback at 2*original_fps.
-                    current_fps = original_fps * 2 
-                    self.message_manager.add_message(f"RIFE 2x interpolation resulted in {len(processed_frames)} frames. Effective FPS: {current_fps:.2f}")
+                    current_fps = original_fps * interpolation_factor 
+                    self.message_manager.add_message(f"RIFE {interpolation_factor}x interpolation resulted in {len(processed_frames)} frames. Effective FPS: {current_fps:.2f}")
             
             elif should_interpolate and len(processed_frames) <= 1:
                 self.message_manager.add_warning("Not enough frames for RIFE interpolation. Skipping.")
 
             op_suffix_parts = []
             if speed_factor != 1.0: op_suffix_parts.append(f"speed{speed_factor:.2f}x".replace('.',',')) 
-            if should_interpolate and self.rife_handler.rife_model is not None: op_suffix_parts.append("RIFE2x")
-            if not op_suffix_parts: op_suffix_parts.append("processed") 
+            if should_interpolate and self.rife_handler.rife_model is not None: 
+                op_suffix_parts.append(f"RIFE{interpolation_factor}x")
+
             op_suffix = "_".join(op_suffix_parts)
 
             temp_video_suffix = f"{op_suffix}_temp_video"
@@ -826,7 +1268,7 @@ class VideoProcessor:
         resolved_video_path = str(Path(video_path).resolve())
         output_path = self._tb_generate_output_path(
             resolved_video_path, 
-            suffix=f"looped_{loop_type}_{num_loops}x",
+            suffix=f"{loop_type}_{num_loops}x",
             target_dir=self.toolbox_video_output_dir
         )
         
@@ -996,7 +1438,7 @@ class VideoProcessor:
             
         filters, applied_filter_descriptions = [], []
 
-        # Filter definitions (unchanged, assuming they are correct)
+        # Filter definitions
         if denoise > 0: filters.append(f"hqdn3d={denoise*0.8:.1f}:{denoise*0.6:.1f}:{denoise*0.7:.1f}:{denoise*0.5:.1f}"); applied_filter_descriptions.append(f"Denoise (hqdn3d)")
         if temperature != 0: mid_shift = (temperature/100.0)*0.3; filters.append(f"colorbalance=rm={mid_shift:.2f}:bm={-mid_shift:.2f}"); applied_filter_descriptions.append(f"Color Temp")
         eq_parts = []; desc_eq = []
@@ -1010,34 +1452,45 @@ class VideoProcessor:
         if film_grain_strength > 0: filters.append(f"noise=alls={film_grain_strength*0.5:.1f}:allf=t+u"); applied_filter_descriptions.append(f"Film Grain")
         if vignette > 0: filters.append(self._tb_create_vignette_filter(vignette, video_width, video_height)); applied_filter_descriptions.append(f"Vignette")
 
-        if not filters: self.message_manager.add_message("ℹ️ No filters selected."); progress(1.0); return video_path
-        if applied_filter_descriptions: self.message_manager.add_message("🔧 Applying FFmpeg filters: " + ", ".join(applied_filter_descriptions))
+        # --- CORRECTED LOGIC ---
+        if applied_filter_descriptions:
+            self.message_manager.add_message("🔧 Applying FFmpeg filters: " + ", ".join(applied_filter_descriptions))
+        else:
+            self.message_manager.add_message("ℹ️ No filters selected. Passing video through (re-encoding).")
         
         progress(0.2, desc="Preparing filter command...")
         original_video_has_audio = self._tb_has_audio_stream(resolved_video_path)
         
         try:
             ffmpeg_cmd = [
-                self.ffmpeg_exe, "-y", "-loglevel", "error", "-i", resolved_video_path,
-                "-vf", ",".join(filters), 
+                self.ffmpeg_exe, "-y", "-loglevel", "error", "-i", resolved_video_path
+            ]
+            # Conditionally add the video filter flag only if there are filters to apply
+            if filters:
+                ffmpeg_cmd.extend(["-vf", ",".join(filters)])
+            
+            # Add the rest of the encoding options
+            ffmpeg_cmd.extend([
                 "-c:v", "libx264", "-preset", "medium", "-crf", "20",
                 "-pix_fmt", "yuv420p",
                 "-map", "0:v:0" 
-            ]
+            ])
+
             if original_video_has_audio:
                 self.message_manager.add_message("Original video has audio. Re-encoding to AAC for filtered video.", "INFO")
                 ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "192k", "-map", "0:a:0?"])
             else:
                 self.message_manager.add_message("No audio in original or detection issue. Filtered video will be silent.", "INFO")
                 ffmpeg_cmd.extend(["-an"])
+            
             ffmpeg_cmd.append(output_path)
 
-            self.message_manager.add_message("🔄 Processing filters with FFmpeg...")
+            self.message_manager.add_message("🔄 Processing with FFmpeg...")
             progress(0.5, desc="Running FFmpeg for filters...")
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, errors='ignore') 
             
             progress(1.0, desc="Filters applied successfully.")
-            self.message_manager.add_success(f"✅ Filters applied! Output: {output_path}")
+            self.message_manager.add_success(f"✅ Filter step complete! Output: {output_path}")
             return output_path
         except subprocess.CalledProcessError as e_filters:
             self._tb_log_ffmpeg_error(e_filters, "filter application")
@@ -1146,7 +1599,7 @@ class VideoProcessor:
             progress(0.80, desc="Saving upscaled video stream...")
 
             temp_video_suffix_base = (
-                f"upscaled_{model_key}_{output_scale_factor_ui:.2f}x_tile{tile_size_str_for_log}"
+                f"upscaled_{model_key}"
                 f"{face_enhance_str_for_log.replace('+','_')}"
             )
             if model_key == "RealESR-general-x4v3" and denoise_strength_ui is not None:

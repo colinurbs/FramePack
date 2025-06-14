@@ -290,16 +290,24 @@ def create_interface(
         }
     }
     
-    /* control sizing for tb_input_video_component */    
+    /* hide the gr.Video source selection bar for tb_input_video_component */
+    #toolbox-video-player .source-selection {
+        display: none !important;
+    }
+    /* control sizing for gr.Video components */    
     .video-size video {
         max-height: 60vh;
         min-height: 300px !important;
         object-fit: contain;
     }
-
-    /* hide the gr.Video source selection bar for tb_input_video_component */
-    #toolbox-video-player .source-selection {
-        display: none !important;
+    /* NEW: Closes the gap between input tabs and the pipeline accordion below them */
+    #pipeline-controls-wrapper {
+        margin-top: -15px !important; /* Adjust this value to get the perfect "snug" fit */
+    }
+    /* --- NEW CSS RULE FOR GALLERY SCROLLING --- */
+    #gallery-scroll-wrapper {
+        max-height: 600px; /* Set your desired fixed height */
+        overflow-y: auto;   /* Add a scrollbar only when needed */
     }
 
     """
