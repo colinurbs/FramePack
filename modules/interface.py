@@ -309,7 +309,9 @@ def create_interface(
         max-height: 600px; /* Set your desired fixed height */
         overflow-y: auto;   /* Add a scrollbar only when needed */
     }
-
+    #toolbox-start-pipeline-btn {
+        margin-top: -14px !important; /* Adjust this value to get the perfect alignment */
+    }
     """
 
     # Get the theme from settings

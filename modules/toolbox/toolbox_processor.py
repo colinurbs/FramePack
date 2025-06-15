@@ -117,6 +117,7 @@ class VideoProcessor:
                         elif op_name == "frame_adjust": output_path = self.tb_process_frames(current_video_path, **op_params, progress=progress)
                         elif op_name == "filters": output_path = self.tb_apply_filters(current_video_path, **op_params, progress=progress)
                         elif op_name == "loop": output_path = self.tb_create_loop(current_video_path, **op_params, progress=progress)
+                        elif op_name == "export": output_path = self.tb_export_video(current_video_path, **op_params, progress=progress)
 
                         if output_path and os.path.exists(output_path):
                             self.message_manager.add_success(f"  -> Step '{op_name}' completed. Output: {os.path.basename(output_path)}")
@@ -803,10 +804,20 @@ class VideoProcessor:
         else:
             base_name_to_use = Path(video_path).stem
 
+        # --- SPECIAL HANDLING FOR GIF OUTPUT PATH ---
+        if export_format == "GIF":
+            # GIFs are always saved to the permanent directory to avoid being lost
+            # by Gradio's re-encoding for the video player preview.
+            target_dir_for_export = self._base_permanent_save_dir
+            self.message_manager.add_message("GIF export detected. Output will be forced to the permanent 'saved_videos' folder, ignoring Autosave setting.", "INFO")
+        else:
+            # For MP4/WebM, respect the current autosave setting
+            target_dir_for_export = self.toolbox_video_output_dir
+            
         output_path = self._tb_generate_output_path(
             base_name_to_use,
             suffix=f"exported_{quality_slider}q_{max_width}w",
-            target_dir=self.toolbox_video_output_dir,
+            target_dir=target_dir_for_export,
             ext=ext
         )
         ffmpeg_cmd.append(output_path)
@@ -816,7 +827,14 @@ class VideoProcessor:
             progress(0.5, desc=f"Encoding to {export_format.upper()}...")
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, errors='ignore')
             progress(1.0, desc="Export complete!")
-            self.message_manager.add_success(f"✅ Successfully exported to {export_format.upper()}! Output: {output_path}")
+
+            # Add specific messaging for GIF vs other formats
+            if export_format == "GIF":
+                self.message_manager.add_success(f"✅ GIF successfully created and saved to: {output_path}")
+                self.message_manager.add_warning("⚠️ Note: The video player shows a re-encoded MP4 for preview. Your original GIF is in the output folder.")
+            else:
+                self.message_manager.add_success(f"✅ Successfully exported to {export_format.upper()}! Output: {output_path}")
+                
             return output_path
             
         except subprocess.CalledProcessError as e:

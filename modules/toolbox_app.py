@@ -185,6 +185,10 @@ def tb_handle_save_user_preset(new_preset_name_str, *slider_values):
 
     clean_preset_name = new_preset_name_str.strip()
 
+    if clean_preset_name.lower() == "none":
+        tb_message_mgr.add_warning("'none' is a protected preset and cannot be overwritten.")
+        return gr.update(), tb_update_messages(), gr.update(value="") # Clear input box
+
     new_preset_values = dict(zip(TB_DEFAULT_FILTER_SETTINGS.keys(), slider_values))
     preset_existed = clean_preset_name in tb_filter_presets_data
     tb_filter_presets_data[clean_preset_name] = new_preset_values
@@ -233,6 +237,59 @@ def tb_handle_delete_user_preset(preset_name_to_delete):
         selected_val_after_error = clean_preset_name if clean_preset_name in current_choices else "none"
         sliders_after_error_values = tb_update_filter_sliders_from_preset(selected_val_after_error)
         return gr.update(choices=current_choices, value=selected_val_after_error), tb_update_messages(), gr.update(value=selected_val_after_error), *sliders_after_error_values
+
+# --- Workflow Presets Handling ---
+TB_WORKFLOW_PRESETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolbox", "data", "workflow_presets.json")
+tb_workflow_presets_data = {} # Will be populated by _initialize_workflow_presets
+
+# This helper function creates a dictionary of all default parameter values
+def _get_default_workflow_params():
+    # Gets default values from filter settings and adds other op defaults
+    params = TB_DEFAULT_FILTER_SETTINGS.copy()
+    params.update({
+        "upscale_model": list(tb_processor.esrgan_upscaler.supported_models.keys())[0] if tb_processor.esrgan_upscaler.supported_models else None,
+        "upscale_factor": 2.0, # A sensible default
+        "tile_size": 0,
+        "enhance_face": False,
+        "denoise_strength": 0.5,
+        "fps_mode": "No Interpolation",
+        "speed_factor": 1.0,
+        "loop_type": "loop",
+        "num_loops": 1,
+        "export_format": "MP4",
+        "export_quality": 85,
+        "export_max_width": 1024,
+    })
+    return params
+
+def _initialize_workflow_presets():
+    global tb_workflow_presets_data
+    # The 'None' preset stores default values for all controls and no active steps
+    default_workflow_map = {
+        "None": {
+            "active_steps": [],
+            "params": _get_default_workflow_params()
+        }
+    }
+    try:
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(TB_WORKFLOW_PRESETS_FILE), exist_ok=True)
+        if not os.path.exists(TB_WORKFLOW_PRESETS_FILE):
+            tb_message_mgr.add_message(f"Workflow presets file not found. Creating with a default 'None' preset: {TB_WORKFLOW_PRESETS_FILE}", "INFO")
+            with open(TB_WORKFLOW_PRESETS_FILE, 'w') as f:
+                json.dump(default_workflow_map, f, indent=4)
+            tb_workflow_presets_data = default_workflow_map
+        else:
+            with open(TB_WORKFLOW_PRESETS_FILE, 'r') as f:
+                tb_workflow_presets_data = json.load(f)
+            # Ensure "None" preset always exists and is up-to-date
+            tb_workflow_presets_data["None"] = default_workflow_map["None"]
+            tb_message_mgr.add_message(f"Workflow presets loaded from {TB_WORKFLOW_PRESETS_FILE}.", "INFO")
+    except Exception as e:
+        tb_message_mgr.add_error(f"Error with workflow presets file {TB_WORKFLOW_PRESETS_FILE}: {e}. Using in-memory defaults.")
+        tb_workflow_presets_data = default_workflow_map
+
+_initialize_workflow_presets() # Call once when the script module is loaded
 
 def tb_handle_apply_filters(video_path, brightness, contrast, saturation, temperature,
                          sharpen, blur, denoise, vignette,
@@ -405,6 +462,150 @@ def tb_handle_input_tab_change(evt: gr.SelectData):
         visibility_update  # tb_batch_include_loop
     )
 
+# --- START: New Workflow Preset Handlers ---
+
+def tb_handle_save_workflow_preset(preset_name, active_steps, *params):
+    global tb_workflow_presets_data
+    tb_message_mgr.clear()
+
+    if not preset_name or not preset_name.strip():
+        tb_message_mgr.add_warning("Workflow Preset name cannot be empty.")
+        return gr.update(), gr.update(value=preset_name), tb_update_messages()
+
+    clean_name = preset_name.strip()
+    param_keys = [
+        # Upscale
+        "upscale_model", "upscale_factor", "tile_size",
+        "enhance_face", "denoise_strength",
+        # Frame Adjust
+        "fps_mode", "speed_factor",
+        # Loop
+        "loop_type", "num_loops",
+        # Filters (using the ordered keys from the constant)
+        *list(TB_DEFAULT_FILTER_SETTINGS.keys()),
+        # Export
+        "export_format", "export_quality", "export_max_width"
+    ]
+    
+    # Pack the parameters into a dictionary
+    params_dict = dict(zip(param_keys, params))
+
+    new_preset_data = {
+        "active_steps": active_steps,
+        "params": params_dict
+    }
+
+    preset_existed = clean_name in tb_workflow_presets_data
+    tb_workflow_presets_data[clean_name] = new_preset_data
+
+    try:
+        with open(TB_WORKFLOW_PRESETS_FILE, 'w') as f:
+            json.dump(tb_workflow_presets_data, f, indent=4)
+
+        tb_message_mgr.add_success(f"Workflow Preset '{clean_name}' {'updated' if preset_existed else 'saved'} successfully!")
+        
+        # Update dropdown choices
+        updated_choices = sorted([k for k in tb_workflow_presets_data.keys() if k != "None"])
+        updated_choices.insert(0, "None")
+        
+        return gr.update(choices=updated_choices, value=clean_name), "", tb_update_messages()
+
+    except Exception as e:
+        tb_message_mgr.add_error(f"Error saving workflow preset '{clean_name}': {e}")
+        # Revert to last known good state
+        _initialize_workflow_presets()
+        return gr.update(), gr.update(value=preset_name), tb_update_messages()
+
+def tb_handle_load_workflow_preset(preset_name):
+    tb_message_mgr.clear()
+    preset_data = tb_workflow_presets_data.get(preset_name)
+
+    if not preset_data:
+        tb_message_mgr.add_warning(f"Workflow preset '{preset_name}' not found. Loading 'None' state.")
+        preset_data = tb_workflow_presets_data.get("None")
+
+    # Get the default parameter structure to ensure all keys are present
+    final_params = _get_default_workflow_params()
+    # Update with the loaded preset's parameters
+    final_params.update(preset_data.get("params", {}))
+    
+    active_steps = preset_data.get("active_steps", [])
+
+    # The order of values returned MUST match the order of components in the event handler's output list
+    ordered_values = [
+        # Checkbox
+        active_steps,
+        # Upscale
+        final_params["upscale_model"], final_params["upscale_factor"], final_params["tile_size"],
+        final_params["enhance_face"], final_params["denoise_strength"],
+        # Frame Adjust
+        final_params["fps_mode"], final_params["speed_factor"],
+        # Loop
+        final_params["loop_type"], final_params["num_loops"],
+        # Filters (must be in the same order as _ORDERED_FILTER_SLIDERS_)
+        final_params["brightness"], final_params["contrast"], final_params["saturation"],
+        final_params["temperature"], final_params["sharpen"], final_params["blur"],
+        final_params["denoise"], final_params["vignette"], final_params["s_curve_contrast"],
+        final_params["film_grain_strength"],
+        # Export
+        final_params["export_format"], final_params["export_quality"], final_params["export_max_width"]
+    ]
+
+    tb_message_mgr.add_message(f"Loaded workflow preset: '{preset_name}'")
+    # Also return the preset name to the input box, and the updated messages
+    return preset_name, *ordered_values, tb_update_messages()
+
+def tb_handle_delete_workflow_preset(preset_name):
+    global tb_workflow_presets_data
+    tb_message_mgr.clear()
+
+    if not preset_name or not preset_name.strip():
+        tb_message_mgr.add_warning("No workflow preset name provided to delete.")
+        # Return updates for all components, but change nothing
+        return gr.update(), gr.update(), *([gr.update()] * 23), tb_update_messages()
+
+
+    clean_name = preset_name.strip()
+    if clean_name == "None":
+        tb_message_mgr.add_warning("'None' preset cannot be deleted.")
+        return gr.update(value="None"), gr.update(), *([gr.update()] * 23), tb_update_messages()
+
+    if clean_name not in tb_workflow_presets_data:
+        tb_message_mgr.add_warning(f"Workflow preset '{clean_name}' not found.")
+        return gr.update(), gr.update(), *([gr.update()] * 23), tb_update_messages()
+
+    del tb_workflow_presets_data[clean_name]
+
+    try:
+        with open(TB_WORKFLOW_PRESETS_FILE, 'w') as f:
+            json.dump(tb_workflow_presets_data, f, indent=4)
+        tb_message_mgr.add_success(f"Workflow preset '{clean_name}' deleted.")
+
+        updated_choices = sorted([k for k in tb_workflow_presets_data.keys() if k != "None"])
+        updated_choices.insert(0, "None")
+        
+        # After deleting, load the "None" state to get the reset values
+        none_state_outputs = tb_handle_load_workflow_preset("None")
+        
+        # The rest of the values come from the 'load' function, but we skip its first value (which was also for the textbox)
+        return gr.update(choices=updated_choices, value="None"), "", *none_state_outputs[1:]
+
+    except Exception as e:
+        tb_message_mgr.add_error(f"Error deleting workflow preset '{clean_name}': {e}")
+        _initialize_workflow_presets() # Revert
+        # On error, we don't know the state, so just update the messages
+        return gr.update(), gr.update(value=clean_name), *([gr.update()] * 23), tb_update_messages()
+
+def tb_handle_reset_workflow_to_defaults():
+    # This function loads the 'None' preset to get the reset values for most components...
+    load_outputs = tb_handle_load_workflow_preset("None")
+    # ...then it PREPENDS an update specifically for the dropdown menu.
+    # The first value is for the dropdown, the rest are for the components in _WORKFLOW_LOAD_OUTPUTS_
+    return gr.update(value="None"), *load_outputs
+
+# --- END: New Workflow Preset Handlers ---
+
+
 def tb_handle_start_pipeline(
     # 1. Active Tab Index
     active_tab_index,
@@ -416,10 +617,12 @@ def tb_handle_start_pipeline(
     model_key, output_scale_factor, tile_size, enhance_face, denoise_strength,
     # Frame Adjust
     fps_mode, speed_factor,
-    # Loop (Now before Filters to match the input list order)
+    # Loop
     loop_type, num_loops,
-    # Filters (Now after Loop)
+    # Filters
     brightness, contrast, saturation, temperature, sharpen, blur, denoise, vignette, s_curve_contrast, film_grain_strength,
+    # Export
+    export_format, export_quality, export_max_width,
     progress=gr.Progress()
 ):
     tb_message_mgr.clear()
@@ -450,11 +653,12 @@ def tb_handle_start_pipeline(
         "upscale": "upscale",
         "frames": "frame_adjust",
         "loop": "loop",
-        "filters": "filters"
+        "filters": "filters",
+        "export": "export"
     }
     
     # Define the execution order
-    execution_order = ["upscale", "frame_adjust", "filters", "loop"]
+    execution_order = ["upscale", "frame_adjust", "filters", "loop", "export"]
     
     pipeline_config = {"operations": []}
 
@@ -494,13 +698,22 @@ def tb_handle_start_pipeline(
                         "s_curve_contrast": s_curve_contrast, "film_grain_strength": film_grain_strength
                     }
                 })
+            elif op_key == "export":
+                pipeline_config["operations"].append({
+                    "name": "export",
+                    "params": {
+                        "export_format": export_format,
+                        "quality_slider": int(export_quality),
+                        "max_width": int(export_max_width)
+                    }
+                })
 
     # Call the batch processor, which now handles both single and batch jobs
     final_video_path = tb_processor.tb_process_video_batch(input_paths_to_process, pipeline_config, progress)
 
     # Return the final video path to the player (will be None for batch, path for single)
     return final_video_path, tb_update_messages()
-    
+
 def tb_handle_tab_change_debug(evt: gr.SelectData):
     """Debug handler to confirm tab selection is being registered."""
     if not evt: # Should not happen in practice but good for safety
@@ -512,7 +725,7 @@ def tb_handle_tab_change_debug(evt: gr.SelectData):
     
     # Return the new index for the state and the updated messages
     return index, tb_update_messages()
-
+    
 def tb_handle_upscale_video(video_path, model_key_selected, output_scale_factor_from_slider, tile_size, enhance_face_ui, denoise_strength_from_slider, progress=gr.Progress()):
     tb_message_mgr.clear()
     if video_path is None:
@@ -868,19 +1081,8 @@ def tb_create_video_toolbox_ui():
                             file_count="multiple",
                             type="filepath"
                         )
-
-                with gr.Column(elem_id="pipeline-controls-wrapper"): # Wrapper for CSS targeting
-                    with gr.Accordion("Processing Pipeline - optional for single - required for batch", open=True):
-                        with gr.Group():
-                            tb_pipeline_steps_chkbox = gr.CheckboxGroup(
-                                label="Pipeline Steps (executed in order)",
-                                choices=["upscale", "frames", "filters", "loop"],
-                                value=[], # Default to no steps selected
-                                info="1: configure your settings in the operations tab down below. 2: use this panel to select which to apply. 3: press 'Start Pipeline Processing'"
-                            )
-                            with gr.Row():                              
-                                tb_start_pipeline_btn = gr.Button("🚀 Start Pipeline Processing", variant="primary", size="sm")
-                        
+                tb_start_pipeline_btn = gr.Button("🚀 Start Pipeline Processing", variant="primary", size="sm", elem_id="toolbox-start-pipeline-btn")
+                    
             with gr.Column(scale=1):
                 with gr.Tabs(elem_id="toolbox_output_tabs"):
                     with gr.TabItem("Video Output"):
@@ -893,7 +1095,41 @@ def tb_create_video_toolbox_ui():
                         with gr.Row():
                             tb_use_processed_as_input_btn = gr.Button("Use as Input", size="sm", scale=4)
                             tb_manual_save_btn = gr.Button("Manual Save", variant="secondary", size="sm", scale=4, visible=not initial_autosave_state)
-                
+
+        with gr.Row():                  
+            with gr.Column(scale=1):
+                with gr.Accordion("Processing Pipeline", open=True):
+                    gr.Markdown("Required for batch processing and recommended for single video. ", elem_classes="small-text-info")
+                    with gr.Row(equal_height=False):
+                        with gr.Group():
+                            tb_pipeline_steps_chkbox = gr.CheckboxGroup(
+                                label="Pipeline Steps:",
+                                choices=["upscale", "frames", "filters", "loop", "export"],
+                                value=[],
+                                info="Select which pre-configured operations to run. Executed in order."
+                            )
+                                 
+            # --- Right Column: Workflow Presets ---
+            with gr.Column(scale=1):
+                with gr.Accordion("Workflow Presets", open=True):
+                    gr.Markdown("Save/load all operation settings and active steps.", elem_classes="small-text-info")
+                    with gr.Row():
+                        workflow_choices = sorted([k for k in tb_workflow_presets_data.keys() if k != "None"])
+                        workflow_choices.insert(0, "None")
+                        with gr.Column(scale=1):
+                            tb_workflow_preset_select = gr.Dropdown(
+                                choices=workflow_choices, value="None", label="Load Workflow"
+                            )
+                        with gr.Column(scale=1):    
+                            tb_workflow_preset_name_input = gr.Textbox(
+                            label="Preset Name (for saving)", placeholder="e.g., My Favorite Upscale"
+                        )
+                    with gr.Group():  
+                        with gr.Row():
+                            tb_workflow_save_btn = gr.Button("💾 Save/Update", size="sm", variant="primary")
+                            tb_workflow_delete_btn = gr.Button("🗑️ Delete", size="sm", variant="stop")
+                            tb_workflow_reset_btn = gr.Button("🔄 Reset All to Defaults", size="sm")
+                                    
         with gr.Row():                  
             with gr.Column():
                 with gr.Group():                        
@@ -1118,7 +1354,7 @@ def tb_create_video_toolbox_ui():
                         """
                         *   **Input:** This operation always uses the video in the **'Upload Video' player (top-left)**.
                         *   **Output:** The result will appear in the **'Processed Video' player (top-right)** for you to review.
-                        *   **Saving:** The output is saved to your 'saved_videos' folder if 'Autosave' is enabled. Otherwise, you must click the 'Manual Save' button.
+                        *   **Saving:** The output is saved to your 'saved_videos' folder if 'Autosave' is enabled. Otherwise, you must click the 'Manual Save' button. Note: GIFs will _always_ be saved!
                         *   **Note:** WebM and GIF encoding can be slow for long or high-resolution videos. Please be patient!
                         """
                     )
@@ -1126,7 +1362,7 @@ def tb_create_video_toolbox_ui():
                     with gr.Column(scale=2):
                         tb_export_format_radio = gr.Radio(
                             ["MP4", "WebM", "GIF"], value="MP4", label="Output Format",
-                            info="MP4 is best for general use. WebM is great for web/Discord (smaller size). GIF is for universal animated images (no sound)."
+                            info="MP4 is best for general use. WebM is great for web/Discord (smaller size). GIF is a widely-supported format for short, silent, looping clips. GIF output will always be saved."
                         )
                         tb_export_quality_slider = gr.Slider(
                             0, 100, value=85, step=1, label="Quality",
@@ -1145,76 +1381,86 @@ def tb_create_video_toolbox_ui():
                 tb_export_video_btn = gr.Button("🚀 Export Video", variant="primary")
                 
     with gr.Accordion("💡 Post-processing Guide & Tips", open=False):
-        gr.Markdown(value="""### This set of tools is designed to help you post-process your generated videos.
+        with gr.Tabs():
+            with gr.TabItem("🚀 Getting Started"):
+                gr.Markdown("""
+                ### Welcome to the Toolbox!
+                
+                **1. Input & Output**
+                *   Most tools use the video in the **Upload Video player ⬅️ (top-left)** as their input.
+                *   Your results will appear in the **Processed Video player ➡️ (top-right)**.
 
+                **2. Chaining Operations (Applying multiple effects)**
+                *   To use a result as the input for your next step:
+                    1.  Run an operation (like Upscale).
+                    2.  When the result appears, click the **'Use as Input'** button.
+                    3.  Your result is now in the input player, ready for the next operation!
 
-**Core Workflow:**
-*   **Input & Output:** Most operations use the video in the **'Upload Video' ⬅️ (top-left)** player as their input.
-*   Processed videos will appear in the **'Processed Video' ➡️ (top-right)** player.
-*   **Analysis First:** It's often helpful to upload a video and click **'📊 Analyze Video'** first. This provides details like resolution, frame rate, and duration, which can inform your choices for processing.
-*   **NEW: Batch Processing:**
-    *   Go to the **'Batch Video Input'** tab to upload multiple video files.
-    *   In each operation tab (Upscale, Filters, etc.), check the **'Include in Batch'** box for any process you want to run.
-    *   The operations will run in a fixed order: Upscale -> Frame Adjust -> Loop -> Filters.
-    *   Configure the sliders and settings for each included operation as you normally would.
-    *   Click the **'🚀 Start Batch Process'** button. The app will process each video through the entire selected pipeline.
-    *   Outputs are saved directly to the output folder. Monitor progress in the Console Messages.
+                **3. Saving Your Work**
+                *   **Autosave:** When the `Autosave` checkbox is on, all results are automatically saved to the `saved_videos` folder.
+                *   **Manual Save:** If `Autosave` is off, results go to a temporary folder. Use the **'💾 Manual Save'** button to save the video from the output player permanently.
 
-**Chaining Operations (Applying Multiple Effects):**
-*   To apply several effects one after another (e.g., first upscale, then change speed, then apply filters, etc):
-    1.  Perform the first operation (e.g., apply upscale).
-    2.  Once the processed video appears, click the **'🔄 Use Processed as Input'** button. This moves the result from the 'Processed Video' player to the 'Upload Video' player.
-    3.  Now, the output of the first operation is ready to be the input for your next operation.
-    4.  Repeat as needed.
+                **4. Analyze First!**
+                *   It's a good idea to click the **'Analyze Video'** button after uploading. It gives you helpful info like resolution and frame rate.
+                """)
 
+            with gr.TabItem("⛓️ The Processing Pipeline"):
+                gr.Markdown("""
+                ### Run Multiple Operations at Once
+                The pipeline lets you set up a series of operations and run them with a single click. This is the main way to process videos.
 
-**Saving Your Work:**
-*   By default, all processed videos are auto-saved to the 'saved_videos' folder.
+                **How to Use the Pipeline:**
+                1.  **Configure:** Go to the operation tabs (📈 Upscale, 🎨 Filters, etc.) and set the sliders and options exactly how you want them.
+                2.  **Select:** In the **'Processing Pipeline'** section, check the boxes for the steps you want to run.
+                3.  **Input:** Make sure your video is in the 'Single Video' tab, or your files are in the 'Batch Video' tab.
+                4.  **Execute:** Click the **'🚀 Start Pipeline Processing'** button.
 
-*   **To save outputs manually:**
-    *   Disable the **'Autosave' checkbox**. When unchecked, all processed videos will save to the 'temp_processing' folder.
-    *   Use the **'💾 Save to Permanent Folder'** button (visible if Autosave is off). This saves the current video from the 'Processed Video' player to the 'saved_videos' folder.
+                **Execution Order:**
+                The pipeline always runs in this fixed order, no matter when you check the boxes:
+                `Upscale` ➡️ `Frame Adjust` ➡️ `Filters` ➡️ `Loop` ➡️ `Export`
 
-*   You can open the permanent output folder using the **'📁 Open Output Folder'** button.
-*   You can empty the 'temp_processing' folder by pressing the **`🗑️ Clear Temporary Files`** button
+                **Single vs. Batch Video:**
+                *   **Single Video:** Processes one video. The final result will appear in the output player.
+                *   **Batch Video:** Processes multiple videos. Each video will go through the entire pipeline. Outputs are saved directly to a new, timestamped folder inside `saved_videos`. The output player will only show the very last video processed.
 
+                **Workflow Presets:**
+                *   Use presets to **save and load your entire pipeline setup**, including all slider values and selected steps.
+                """)
 
-**Working with Video Filters & Presets:**
-*   Adjust visual effects like brightness, contrast, and color using the **Filter Sliders**.
-*   **Load Preset Dropdown:** Select a pre-defined or saved custom look.
-*   **Preset Name Textbox:**
-    *   Shows the loaded preset's name.
-    *   Type a new name here to save current slider settings as a new preset.
-*   **💾 Save/Update Button:** Saves the current slider settings using the name in the 'Preset Name' textbox. Adds new presets to the dropdown or updates existing ones.
-*   **🗑️ Delete Button:** Deletes the preset whose name is currently in the 'Preset Name' textbox from your saved presets.
-*   **🔄 Reset All Sliders Button:** Clears all filter effects, sets sliders to default ("none" preset values).
-*   **✨ Apply Filters to Video Button:** Processes the input video with the current filter slider settings.
+            with gr.TabItem("🖼️ Frames Studio Workflow"):
+                gr.Markdown("""
+                ### Edit Your Video Frame-by-Frame
+                The Frames Studio lets you break a video into images, edit them, and put them back together.
 
-**NEW: Using the Frames Studio**
-*   The **Frames Studio** tab now follows a 3-step workflow: Extract -> Studio -> Reassemble.
-*   **1. Extract:** Use the 'Extract Frames' section to get images from your input video. A new folder is created for them in `postprocessed_output/frames/extracted_frames/`.
-*   **2. Frames Studio:**
-    *   Click **'🔄 Refresh List'** to see your newly extracted folder in the dropdown.
-    *   Select the folder you want to edit and click **'🖼️ Load Frames to Studio'**.
-    *   All frames from that folder will appear in the gallery below.
-    *   **Click a frame** in the gallery to select it and see its details.
-    *   Use the **'🗑️ Delete Selected Frame'** button to permanently remove unwanted frames like glitches or bad transitions from the folder.
-    *   Use the **'💾 Save Selected Frame'** button to save a copy of the selected frame to your main `saved_videos` folder, perfect for using as a starting image for a new generation.
-*   **3. Reassemble:** Once you are done curating your frames in the studio, use the 'Reassemble From Studio' button. This will create a new video from only the frames currently remaining in the folder.
+                **Step 1: Extract Frames**
+                *   Upload a video and use the **'🔨 Extract Frames'** button.
+                *   This creates a new folder of images in `postprocessed_output/frames/extracted_frames/`.
+                *   ⚠️ **Warning:** Extracting from long or high-res videos can use a lot of disk space!
 
+                **Step 2: Edit in the Studio**
+                *   Click **'🔄 Refresh List'** to find your new folder, then click **'🖼️ Load Frames to Studio'**.
+                *   The frames will appear in the gallery. Click a frame to select it.
+                *   **Delete Frames:** Use the **'🗑️ Delete Selected Frame'** button to remove bad frames or glitches.
+                *   **Save Frames:** Use the **'💾 Save Selected Frame'** button to save a high-quality copy of a single frame. Perfect for use as an image prompt!
 
-**Unloading the Main Studio Model:**
-*   The **'📤 Unload Studio Model'** button attempts to remove the main video generation model from your computer's memory (VRAM).
-*   **Why use this?**
-    *   To free up VRAM if you plan to run memory-heavy tasks in this toolbox (like '📈 Upscale Video') and are not actively using the main video generation tab.
+                **Step 3: Reassemble Video**
+                *   Once you're done editing, use the **'🧩 Reassemble From Studio'** button.
+                *   This creates a new video using only the frames that are left in the folder.
+                """)
+            
+            with gr.TabItem("⚙️ Other Tools & Tips"):
+                 gr.Markdown("""
+                ### Individual Operations
+                *   **🧩 Join Videos:** Combine multiple video clips into a single video file. The tool will automatically handle different resolutions and audio.
+                *   **📦 Export & Compress:** A powerful tool to make your final video smaller. You can lower the quality, resize the video, or convert it to `MP4`, `WebM`, or a silent `GIF`.
 
-*   The main Studio interface will automatically reload this model when you start a new generation task there.
+                ### Memory Management
+                *   The **'📤 Unload Studio Model'** button can free up VRAM by removing the main video generation model from memory.
+                *   This is useful before running a heavy task here, like a 4K video upscale. The main app will reload the model automatically when you need it again.
 
-
-
-**Check Console Messages:**
-*   The **'Console Messages' box** at the bottom of the tab provides important feedback, status updates, warnings, and error messages for all operations. Always check it if something doesn't seem right!
-            """)
+                ### 👇 Check Console Messages!
+                *   The text box at the very bottom of the page shows important status updates, warnings, and error messages. If something isn't working, the answer is probably there!
+                """)
 
     with gr.Row():
         tb_message_output = gr.Textbox(label="Console Messages", lines=10, interactive=False, elem_classes="message-box", value=tb_update_messages)
@@ -1230,20 +1476,63 @@ def tb_create_video_toolbox_ui():
             tb_filter_s_curve_contrast, tb_filter_film_grain_strength
         ]
         
-        _ALL_PIPELINE_INPUTS_ = [
-            tb_active_tab_index_storage, # Use the hidden gr.Number instead of gr.State
-            tb_pipeline_steps_chkbox,
-            # Inputs
-            tb_input_video_component, tb_batch_input_files,
+        # A list of all operation parameter components in the correct order for workflow presets
+        _ALL_PIPELINE_PARAMS_COMPONENTS_ = [
             # Upscale
-            tb_upscale_model_select, tb_upscale_factor_slider, tb_upscale_tile_size_radio, tb_upscale_enhance_face_checkbox, tb_denoise_strength_slider,
+            tb_upscale_model_select, tb_upscale_factor_slider, tb_upscale_tile_size_radio,
+            tb_upscale_enhance_face_checkbox, tb_denoise_strength_slider,
             # Frame Adjust
             tb_process_fps_mode, tb_process_speed_factor,
             # Loop
             tb_loop_type_select, tb_num_loops_slider,
             # Filters
-            *_ORDERED_FILTER_SLIDERS_
+            *_ORDERED_FILTER_SLIDERS_,
+            # Export
+            tb_export_format_radio, tb_export_quality_slider, tb_export_resize_slider
         ]
+        
+        # The list of all inputs for the main pipeline execution
+        _ALL_PIPELINE_INPUTS_ = [
+            tb_active_tab_index_storage,
+            tb_pipeline_steps_chkbox,
+            # Inputs
+            tb_input_video_component, tb_batch_input_files,
+            # Parameters
+            *_ALL_PIPELINE_PARAMS_COMPONENTS_
+        ]
+
+        # --- NEW: Workflow Preset Event Handlers ---
+        tb_workflow_save_btn.click(
+            fn=tb_handle_save_workflow_preset,
+            inputs=[tb_workflow_preset_name_input, tb_pipeline_steps_chkbox, *_ALL_PIPELINE_PARAMS_COMPONENTS_],
+            outputs=[tb_workflow_preset_select, tb_workflow_preset_name_input, tb_message_output]
+        )
+
+        # The list of outputs for loading must include the name box, then ALL controls in the correct order
+        _WORKFLOW_LOAD_OUTPUTS_ = [
+            tb_workflow_preset_name_input, # First output is the name box
+            tb_pipeline_steps_chkbox,      # Second is the checkbox group
+            *_ALL_PIPELINE_PARAMS_COMPONENTS_, # Then all the parameter controls
+            tb_message_output              # Finally, the message box
+        ]
+        tb_workflow_preset_select.change(
+            fn=tb_handle_load_workflow_preset,
+            inputs=[tb_workflow_preset_select],
+            outputs=_WORKFLOW_LOAD_OUTPUTS_
+        )
+        tb_workflow_delete_btn.click(
+            fn=tb_handle_delete_workflow_preset,
+            inputs=[tb_workflow_preset_name_input],
+            # This list now also needs the dropdown prepended
+            outputs=[tb_workflow_preset_select, *_WORKFLOW_LOAD_OUTPUTS_]
+        )
+        tb_workflow_reset_btn.click(
+            fn=tb_handle_reset_workflow_to_defaults,
+            inputs=None,
+            # The outputs list now starts with the dropdown, followed by the standard load outputs
+            outputs=[tb_workflow_preset_select, *_WORKFLOW_LOAD_OUTPUTS_]
+        )
+        # --- End Workflow Preset Handlers ---
 
         tb_start_pipeline_btn.click(
             fn=tb_handle_start_pipeline,
@@ -1431,6 +1720,13 @@ if __name__ == "__main__":
             max-height: 600px; /* Set your desired fixed height */
             overflow-y: auto;   /* Add a scrollbar only when needed */
         }
+        /* ---  --- */
+        #toolbox-start-pipeline-btn {
+            margin-top: -14px !important; /* Adjust this value to get the perfect alignment */
+        }
+        .small-text-info {
+            font-size: 0.6rem !important; /* Start with a more reasonable size */
+        }
         """
 
         # 3. Get the output directory path from the existing settings instance
@@ -1448,11 +1744,11 @@ if __name__ == "__main__":
             )
             
             tb_create_video_toolbox_ui()
-            
-        # 5. Launch the Gradio app with all the configured arguments
         print(f"Launching Toolbox server. Access it at http://{args.server}:{args.port if args.port else 7860}")
         block.launch(
             server_name=args.server,
+            
+        # 5. Launch the Gradio app with all the configured arguments
             server_port=args.port,
             share=args.share,
             inbrowser=args.inbrowser,
